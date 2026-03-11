@@ -21,6 +21,26 @@ Two thin wrapper scripts — `claude-zellij` and `codex-zellij` — plus a Zelli
 
 After a crash, just reattach (`zellij attach <session>`) and every AI pane picks up exactly where it left off.
 
+## Demo
+
+### 1. Before crash — 4 Claude instances running
+
+![Before crash](figures/01-before-crash.png)
+
+Four `claude-zellij` panes (Test1–Test4) each hold an independent conversation in the same Zellij session.
+
+### 2. After crash — Zellij resurrection pending
+
+![Resurrection pending](figures/02-resurrection-pending.png)
+
+After `pkill -9 zellij` and `zellij attach`, Zellij reconstructs each pane with the correct recovery command. Panes launched via `claude-zellij` show `claude --resume <session-id>` or re-exec the wrapper with the marker UUID. Press **Enter** to resume.
+
+### 3. After recovery — conversations restored
+
+![After recovery](figures/03-after-recovery.png)
+
+All four conversations are back exactly where they left off — each pane resumes its own session, not somebody else's.
+
 ## How It Works
 
 Both wrappers follow the same architecture:
