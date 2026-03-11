@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# claude-zellij
+# Start interactive Claude sessions inside Zellij with per-pane recovery.
+#
+# Recovery model:
+#   1. Generates a marker UUID and re-execs itself with --zellij-marker <uuid>
+#      so Zellij serializes the marker in the pane command.
+#   2. Starts claude --session-id <uuid> as a child process (not exec), which
+#      prevents MCP child processes from being discovered by Zellij instead of claude.
+#   3. A background watcher monitors ~/.claude/history.jsonl for /resume commands.
+#      When the user switches sessions via /resume, the watcher updates the stored
+#      session ID so resurrection lands on the correct conversation.
+#   4. On resurrection, the wrapper reads the stored session ID and runs
+#      claude --resume <session-id>.
+
+MARKER_DIR="$HOME/.local/share/claude-zellij/markers"
+
+# Subcommands that should pass through unchanged
+readonly SUBCOMMANDS="auth mcp doctor update upgrade setup-token install agents plugin plugins"
+
+# Flags that indicate non-default invocations we should not inject into
+readonly PASSTHROUGH_FLAGS="-c --continue -r --resume --session-id -p --print -h --help -v --version"
+
+# --- Parse --zellij-marker (our internal flag, not a claude flag) ---
+MARKER=""
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--zellij-marker" && -n "${2:-}" ]]; then
+        MARKER="$2"
+        shift 2
+    else
+        ARGS+=("$1")
+        shift
+    fi
+done
+set -- "${ARGS[@]}"
+
+# --- Check for passthrough flags and subcommands ---
+first_non_flag=""
+for arg in "$@"; do
+    for flag in $PASSTHROUGH_FLAGS; do
+        [[ "$arg" == "$flag" ]] && exec claude "$@"
+    done
+    if [[ -z "$first_non_flag" && "$arg" != -* ]]; then
+        first_non_flag="$arg"
+    fi
+done
+
+if [[ -n "$first_non_flag" ]]; then
+    for subcmd in $SUBCOMMANDS; do
+        [[ "$first_non_flag" == "$subcmd" ]] && exec claude "$@"
+    done
+fi
+
+# --- First invocation: generate marker and re-exec to embed it ---
+if [[ -z "$MARKER" ]]; then
+    MARKER="$(uuidgen)"
+    exec "$0" --zellij-marker "$MARKER" "$@"
+fi
+
+mkdir -p "$MARKER_DIR"
+MARKER_FILE="$MARKER_DIR/$MARKER"
+
+# --- Resurrection: stored session ID exists ---
+if [[ -f "$MARKER_FILE" ]]; then
+    SESSION_ID="$(cat "$MARKER_FILE")"
+    if [[ -n "$SESSION_ID" ]]; then
+        exec claude --resume "$SESSION_ID"
+    fi
+    # Marker file empty — fall back
+    exec claude --continue
+fi
+
+# --- Fresh start ---
+# Generate a Claude session UUID and store it in the marker file
+CLAUDE_UUID="$(uuidgen)"
+echo "$CLAUDE_UUID" > "$MARKER_FILE"
+
+# Background watcher: track /resume session changes via history.jsonl
+HISTORY_FILE="$HOME/.claude/history.jsonl"
+WRAPPER_PID=$$
+(
+    trap '' INT TERM HUP  # Don't die from signals meant for claude
+    CURRENT="$CLAUDE_UUID"
+    LAST_LINES="$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo 0)"
+    SAW_RESUME=false
+
+    while kill -0 "$WRAPPER_PID" 2>/dev/null; do
+        sleep 3
+        NOW_LINES="$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo 0)"
+        [[ "$NOW_LINES" -le "$LAST_LINES" ]] && continue
+
+        # Process only new lines
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            SID="$(echo "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | sed 's/"sessionId":"//;s/"//')"
+            [[ -z "$SID" ]] && continue
+
+            # Detect /resume from our current session
+            if [[ "$SID" == "$CURRENT" ]] && echo "$line" | grep -q '"display":"/resume'; then
+                SAW_RESUME=true
+                # Try to extract explicit target UUID from the /resume command
+                TARGET="$(echo "$line" | grep -o '"display":"/resume [^"]*"' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' || true)"
+                if [[ -n "$TARGET" && "$TARGET" != "$CURRENT" ]]; then
+                    echo "$TARGET" > "$MARKER_FILE"
+                    CURRENT="$TARGET"
+                    SAW_RESUME=false
+                fi
+                continue
+            fi
+
+            # After a /resume (interactive picker), the next entry with a
+            # different sessionId is the session the user switched to.
+            if $SAW_RESUME && [[ "$SID" != "$CURRENT" ]]; then
+                echo "$SID" > "$MARKER_FILE"
+                CURRENT="$SID"
+                SAW_RESUME=false
+            fi
+        done < <(tail -n +"$((LAST_LINES + 1))" "$HISTORY_FILE" 2>/dev/null)
+
+        LAST_LINES="$NOW_LINES"
+    done
+) &
+disown
+
+# Run claude in foreground (not exec — so Zellij serializes 'claude-zellij')
+claude --session-id "$CLAUDE_UUID" "$@"

@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# codex-zellij
+# Start Codex sessions inside Zellij with per-pane recovery support.
+#
+# Unlike Claude, Codex doesn't support --session-id. This wrapper works around
+# that by:
+#   1. Generating a marker UUID and embedding it in its own command line (re-exec)
+#   2. Capturing the Codex session ID from session_index.jsonl in the background
+#   3. On resurrection, looking up the stored session ID and running codex resume
+#
+# Zellij serializes the pane command. If it discovers "codex-zellij --zellij-marker
+# <uuid> ...", the wrapper handles resume. If it discovers "codex ..." instead,
+# the hook falls back to "codex resume --last".
+
+set -euo pipefail
+
+MARKER_DIR="$HOME/.local/share/codex-zellij/markers"
+
+# Non-interactive/admin subcommands pass through unchanged.
+# Interactive resume/fork pass through with --no-alt-screen injected.
+readonly NON_INTERACTIVE_SUBCOMMANDS="exec e review login logout mcp mcp-server app-server completion sandbox debug apply a cloud features help"
+readonly INTERACTIVE_SUBCOMMANDS="resume fork"
+
+# Flags that indicate non-interactive invocations
+readonly PASSTHROUGH_FLAGS="-h --help -V --version"
+
+codex_flag_takes_value() {
+    case "$1" in
+        -c|--config|-i|--image|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--add-dir|--enable|--disable)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+contains_word() {
+    local needle="$1"
+    shift
+    local item
+    for item in $*; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+codex_cd_args() {
+    local args=("$@")
+    local cd_args=()
+    local skip_next=false
+    local expecting_cd_value=false
+
+    for arg in "${args[@]}"; do
+        if $skip_next; then
+            if $expecting_cd_value; then
+                cd_args+=("$arg")
+                expecting_cd_value=false
+            fi
+            skip_next=false
+            continue
+        fi
+
+        case "$arg" in
+            --cd=*)
+                cd_args+=("$arg")
+                ;;
+            -C|--cd)
+                cd_args+=("$arg")
+                skip_next=true
+                expecting_cd_value=true
+                ;;
+            -*)
+                if codex_flag_takes_value "$arg"; then
+                    skip_next=true
+                fi
+                ;;
+        esac
+    done
+
+    if [[ ${#cd_args[@]} -gt 0 ]]; then
+        printf '%s\n' "${cd_args[@]}"
+    fi
+}
+
+run_codex_inline() {
+    local args=("$@")
+    local has_no_alt_screen=false
+    local arg
+
+    for arg in "${args[@]}"; do
+        if [[ "$arg" == "--no-alt-screen" ]]; then
+            has_no_alt_screen=true
+            break
+        fi
+    done
+
+    if $has_no_alt_screen; then
+        codex "${args[@]}"
+    else
+        codex --no-alt-screen "${args[@]}"
+    fi
+}
+
+run_interactive_subcommand() {
+    local index="$1"
+    shift
+    local args=("$@")
+    local has_no_alt_screen=false
+    local arg
+
+    for arg in "${args[@]}"; do
+        if [[ "$arg" == "--no-alt-screen" ]]; then
+            has_no_alt_screen=true
+            break
+        fi
+    done
+
+    if $has_no_alt_screen; then
+        exec codex "${args[@]}"
+    fi
+
+    local new_args=(
+        "${args[@]:0:$((index + 1))}"
+        --no-alt-screen
+        "${args[@]:$((index + 1))}"
+    )
+    exec codex "${new_args[@]}"
+}
+
+# --- Parse --zellij-marker (our internal flag, not a codex flag) ---
+MARKER=""
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--zellij-marker" && -n "${2:-}" ]]; then
+        MARKER="$2"
+        shift 2
+    else
+        ARGS+=("$1")
+        shift
+    fi
+done
+set -- "${ARGS[@]}"
+
+# --- Check for passthrough flags and subcommands ---
+args=("$@")
+first_non_flag=""
+first_non_flag_index=-1
+skip_next=false
+for ((i = 0; i < ${#args[@]}; i++)); do
+    arg="${args[i]}"
+
+    if $skip_next; then
+        skip_next=false
+        continue
+    fi
+
+    for flag in $PASSTHROUGH_FLAGS; do
+        [[ "$arg" == "$flag" ]] && exec codex "${args[@]}"
+    done
+
+    case "$arg" in
+        --)
+            if ((i + 1 < ${#args[@]})); then
+                first_non_flag="${args[i + 1]}"
+                first_non_flag_index=$((i + 1))
+            fi
+            break
+            ;;
+        --*=*)
+            ;;
+        -*)
+            if codex_flag_takes_value "$arg"; then
+                skip_next=true
+            fi
+            ;;
+        *)
+            first_non_flag="$arg"
+            first_non_flag_index=$i
+            break
+            ;;
+    esac
+done
+
+if [[ -n "$first_non_flag" ]] && contains_word "$first_non_flag" "$NON_INTERACTIVE_SUBCOMMANDS"; then
+    exec codex "${args[@]}"
+fi
+
+if [[ -n "$first_non_flag" ]] && contains_word "$first_non_flag" "$INTERACTIVE_SUBCOMMANDS"; then
+    run_interactive_subcommand "$first_non_flag_index" "${args[@]}"
+fi
+
+# --- First invocation: generate marker and re-exec to embed it ---
+if [[ -z "$MARKER" ]]; then
+    MARKER="$(uuidgen)"
+    exec "$0" --zellij-marker "$MARKER" "$@"
+fi
+
+mkdir -p "$MARKER_DIR"
+MARKER_FILE="$MARKER_DIR/$MARKER"
+
+# --- Resurrection: stored session ID exists ---
+if [[ -f "$MARKER_FILE" ]]; then
+    SESSION_ID="$(cat "$MARKER_FILE")"
+    mapfile -t CD_ARGS < <(codex_cd_args "$@")
+    if [[ -n "$SESSION_ID" ]]; then
+        exec codex resume "$SESSION_ID" "${CD_ARGS[@]}" --no-alt-screen
+    fi
+    # Marker file empty — fall back
+    exec codex resume --last "${CD_ARGS[@]}" --no-alt-screen
+fi
+
+# --- Fresh start: capture session ID in background, then run codex ---
+INDEX_FILE="$HOME/.codex/session_index.jsonl"
+BEFORE="$(wc -l < "$INDEX_FILE" 2>/dev/null || echo 0)"
+TARGET_LINE=$((BEFORE + 1))
+
+# Background watcher: polls for new session entry and stores the session ID
+(
+    trap '' INT TERM HUP  # Don't die from signals meant for codex
+    for _ in $(seq 1 120); do
+        CURRENT="$(wc -l < "$INDEX_FILE" 2>/dev/null || echo 0)"
+        if [[ "$CURRENT" -ge "$TARGET_LINE" ]]; then
+            SESSION_ID="$(sed -n "${TARGET_LINE}p" "$INDEX_FILE" 2>/dev/null \
+                | grep -o '"id":"[^"]*"' | head -1 | sed 's/"id":"//;s/"//')"
+            if [[ -n "$SESSION_ID" ]]; then
+                echo "$SESSION_ID" > "$MARKER_FILE"
+            fi
+            break
+        fi
+        sleep 0.5
+    done
+) &
+disown
+
+# Run codex in foreground (not exec — so Zellij may serialize "codex-zellij")
+run_codex_inline "$@"

@@ -1,0 +1,102 @@
+// statusbar-fixed.kdl
+// Optional layout workaround for status-bar movement during pane create/close.
+// Usage: zellij -l statusbar-fixed
+// To make permanent: add `default_layout "statusbar-fixed"` to config.kdl
+
+layout {
+    tab_template name="ui" {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+
+    new_tab_template {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+
+    swap_tiled_layout name="vertical" {
+        ui {
+            pane split_direction="vertical" {
+                pane
+                pane
+            }
+        }
+    }
+
+    swap_tiled_layout name="horizontal" {
+        ui {
+            pane split_direction="horizontal" {
+                pane
+                pane
+            }
+        }
+    }
+
+    swap_tiled_layout name="stacked" {
+        ui {
+            pane stacked=true {
+                pane
+                pane
+            }
+        }
+    }
+
+    swap_floating_layout name="staggered" {
+        floating_panes max_panes=1 {
+            pane { x "5%"; y "5%"; width "90%"; height "90%"; }
+        }
+        floating_panes max_panes=2 {
+            pane { x "5%"; y "5%"; width "45%"; height "90%"; }
+            pane { x "50%"; y "5%"; width "45%"; height "90%"; }
+        }
+        floating_panes {
+            pane { x "5%"; y "5%"; width "40%"; height "90%"; }
+            pane { x "25%"; y "10%"; width "40%"; height "80%"; }
+            pane { x "45%"; y "5%"; width "40%"; height "90%"; }
+        }
+    }
+
+    swap_floating_layout name="enlarged" {
+        floating_panes max_panes=1 {
+            pane { x "10%"; y "10%"; width "80%"; height "80%"; }
+        }
+        floating_panes {
+            pane { x "5%"; y "5%"; width "90%"; height "90%"; }
+        }
+    }
+
+    swap_floating_layout name="spread" {
+        floating_panes max_panes=1 {
+            pane { x "10%"; y "10%"; width "80%"; height "80%"; }
+        }
+        floating_panes max_panes=2 {
+            pane { x "5%"; y "10%"; width "40%"; height "80%"; }
+            pane { x "55%"; y "10%"; width "40%"; height "80%"; }
+        }
+        floating_panes {
+            pane { x "5%"; y "5%"; width "28%"; height "90%"; }
+            pane { x "36%"; y "5%"; width "28%"; height "90%"; }
+            pane { x "67%"; y "5%"; width "28%"; height "90%"; }
+        }
+    }
+}
