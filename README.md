@@ -10,7 +10,7 @@ With 8+ AI panes open, reconnecting each one manually is painful.
 
 ## The Solution
 
-Two thin wrapper scripts — `claude-zellij` and `codex-zellij` — plus a Zellij resurrection hook that together give you **per-pane session recovery**:
+Two thin wrapper scripts — `claude-zellij` and `codex-zellij` — plus a Zellij resurrection hook that together give you **per-pane session recovery** and **in-place hot reboot**:
 
 | Tool | Wrapper | Recovery |
 |---|---|---|
@@ -20,6 +20,8 @@ Two thin wrapper scripts — `claude-zellij` and `codex-zellij` — plus a Zelli
 | Bare `codex` | (none needed) | Best-effort fallback via `codex resume --last` |
 
 After a crash, just reattach (`zellij attach <session>`) and every AI pane picks up exactly where it left off.
+
+`claude-zellij` also supports **Ctrl+Y hot reboot** — restart Claude in-place without losing your conversation. This is useful when you change Claude's settings, CLAUDE.md instructions, or MCP server configuration and need Claude to pick them up without starting a new session.
 
 ## Demo
 
@@ -71,10 +73,31 @@ By running the CLI as a child process and keeping the wrapper alive, Zellij seri
 
 Codex doesn't support `--session-id`, so `codex-zellij` captures the session ID from `~/.codex/session_index.jsonl` after Codex starts. The wrapper also forces `--no-alt-screen` for all interactive sessions, which works better with Zellij's pane model.
 
+### Claude: Ctrl+Y hot reboot
+
+Sometimes you need to restart Claude without losing your conversation — for example, after editing `CLAUDE.md`, changing MCP server configuration, or updating Claude Code settings. Normally this means quitting Claude and manually running `claude --resume`, losing your pane context.
+
+`claude-zellij` solves this with a **PTY proxy** (`claude-zellij-pty.py`) that sits between Zellij and the Claude process:
+
+```
+Zellij pane ↔ claude-zellij-pty.py (PTY proxy) ↔ Claude child process
+```
+
+When you press **Ctrl+Y**:
+
+1. The proxy sends SIGTERM to the running Claude child process
+2. It reads the current session ID from the marker file (which the `/resume` watcher keeps up to date)
+3. It launches a new `claude --resume <session-id>` on a fresh PTY
+4. Terminal dimensions are synchronized so Claude's TUI renders correctly
+5. The new Claude instance picks up right where you left off, with all settings reloaded
+
+This happens in-place — no new pane, no tab switching, no manual `--resume` flag. The Zellij pane stays the same, and from the user's perspective Claude simply restarts in the same conversation with refreshed configuration.
+
 ## Prerequisites
 
 - [Zellij](https://zellij.dev/) 0.43+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`) and/or [Codex CLI](https://github.com/openai/codex) (`codex`)
+- Python 3 (for the Ctrl+Y hot reboot PTY proxy)
 - `uuidgen` (pre-installed on most Linux distributions)
 - Bash 4+
 
