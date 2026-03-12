@@ -8,6 +8,7 @@ import pty
 import select
 import signal
 import fcntl
+import subprocess
 import sys
 import termios
 import tty
@@ -81,6 +82,21 @@ def terminate_child(pid: int) -> None:
             continue
 
 
+def clear_zellij_pane() -> None:
+    if "ZELLIJ" not in os.environ:
+        return
+    try:
+        subprocess.run(
+            ["zellij", "action", "clear"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        pass
+
+
 def main() -> int:
     wrapper, marker, wrapper_args, child_cmd = parse_argv(sys.argv[1:])
 
@@ -129,6 +145,7 @@ def main() -> int:
                         os.write(master_fd, prefix)
                     terminate_child(pid)
                     restore_tty(stdin_fd, old_tty)
+                    clear_zellij_pane()
                     os.write(stdout_fd, b"\r\n[claude-zellij] rebooting current Claude session...\r\n")
                     os.execv(wrapper, [wrapper, "--zellij-marker", marker, *wrapper_args])
 
