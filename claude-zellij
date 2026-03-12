@@ -10,16 +10,88 @@
 #   3. A background watcher monitors ~/.claude/history.jsonl for /resume commands.
 #      When the user switches sessions via /resume, the watcher updates the stored
 #      session ID so resurrection lands on the correct conversation.
-#   4. On resurrection, the wrapper reads the stored session ID and runs
-#      claude --resume <session-id>.
+#   4. On resurrection or Ctrl+Y reboot, the wrapper reads the stored session ID
+#      and runs claude --resume <session-id>.
+
+set -euo pipefail
 
 MARKER_DIR="$HOME/.local/share/claude-zellij/markers"
+HELPER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-zellij-pty.py"
 
 # Subcommands that should pass through unchanged
 readonly SUBCOMMANDS="auth mcp doctor update upgrade setup-token install agents plugin plugins"
 
 # Flags that indicate non-default invocations we should not inject into
 readonly PASSTHROUGH_FLAGS="-c --continue -r --resume --session-id -p --print -h --help -v --version"
+
+start_history_watcher() {
+    local marker_file="$1"
+    local initial_session_id="$2"
+    local history_file="$HOME/.claude/history.jsonl"
+    local wrapper_pid="$$"
+    local watcher_pid_file="${marker_file}.watcher"
+    local existing_watcher_pid=""
+
+    if [[ -f "$watcher_pid_file" ]]; then
+        existing_watcher_pid="$(cat "$watcher_pid_file" 2>/dev/null || true)"
+        if [[ -n "$existing_watcher_pid" ]] && kill -0 "$existing_watcher_pid" 2>/dev/null; then
+            return
+        fi
+    fi
+
+    (
+        trap '' INT TERM HUP  # Don't die from signals meant for claude
+        local current="$initial_session_id"
+        local last_lines
+        local saw_resume=false
+        local now_lines
+        local line
+        local sid
+        local target
+
+        last_lines="$(wc -l < "$history_file" 2>/dev/null || echo 0)"
+
+        while kill -0 "$wrapper_pid" 2>/dev/null; do
+            sleep 3
+            now_lines="$(wc -l < "$history_file" 2>/dev/null || echo 0)"
+            [[ "$now_lines" -le "$last_lines" ]] && continue
+
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                sid="$(echo "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | sed 's/"sessionId":"//;s/"//')"
+                [[ -z "$sid" ]] && continue
+
+                if [[ "$sid" == "$current" ]] && echo "$line" | grep -q '"display":"/resume'; then
+                    saw_resume=true
+                    target="$(echo "$line" | grep -o '"display":"/resume [^"]*"' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' || true)"
+                    if [[ -n "$target" && "$target" != "$current" ]]; then
+                        echo "$target" > "$marker_file"
+                        current="$target"
+                        saw_resume=false
+                    fi
+                    continue
+                fi
+
+                if $saw_resume && [[ "$sid" != "$current" ]]; then
+                    echo "$sid" > "$marker_file"
+                    current="$sid"
+                    saw_resume=false
+                fi
+            done < <(tail -n +"$((last_lines + 1))" "$history_file" 2>/dev/null)
+
+            last_lines="$now_lines"
+        done
+    ) &
+    echo "$!" > "$watcher_pid_file"
+    disown
+}
+
+launch_claude_with_hotkey() {
+    local marker="$1"
+    shift
+    local wrapper_args=("$@")
+    exec "$HELPER_PATH" --wrapper "$0" --marker "$marker" "${wrapper_args[@]}" -- "${CLAUDE_CMD[@]}"
+}
 
 # --- Parse --zellij-marker (our internal flag, not a claude flag) ---
 MARKER=""
@@ -61,67 +133,20 @@ fi
 mkdir -p "$MARKER_DIR"
 MARKER_FILE="$MARKER_DIR/$MARKER"
 
-# --- Resurrection: stored session ID exists ---
+# --- Resume existing marker or start a fresh Claude session ---
 if [[ -f "$MARKER_FILE" ]]; then
     SESSION_ID="$(cat "$MARKER_FILE")"
     if [[ -n "$SESSION_ID" ]]; then
-        exec claude --resume "$SESSION_ID"
+        CLAUDE_CMD=(claude --resume "$SESSION_ID")
+        start_history_watcher "$MARKER_FILE" "$SESSION_ID"
+        launch_claude_with_hotkey "$MARKER" "$@"
     fi
-    # Marker file empty — fall back
-    exec claude --continue
+    CLAUDE_CMD=(claude --continue)
+    launch_claude_with_hotkey "$MARKER" "$@"
 fi
 
-# --- Fresh start ---
-# Generate a Claude session UUID and store it in the marker file
 CLAUDE_UUID="$(uuidgen)"
 echo "$CLAUDE_UUID" > "$MARKER_FILE"
-
-# Background watcher: track /resume session changes via history.jsonl
-HISTORY_FILE="$HOME/.claude/history.jsonl"
-WRAPPER_PID=$$
-(
-    trap '' INT TERM HUP  # Don't die from signals meant for claude
-    CURRENT="$CLAUDE_UUID"
-    LAST_LINES="$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo 0)"
-    SAW_RESUME=false
-
-    while kill -0 "$WRAPPER_PID" 2>/dev/null; do
-        sleep 3
-        NOW_LINES="$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo 0)"
-        [[ "$NOW_LINES" -le "$LAST_LINES" ]] && continue
-
-        # Process only new lines
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            SID="$(echo "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | sed 's/"sessionId":"//;s/"//')"
-            [[ -z "$SID" ]] && continue
-
-            # Detect /resume from our current session
-            if [[ "$SID" == "$CURRENT" ]] && echo "$line" | grep -q '"display":"/resume'; then
-                SAW_RESUME=true
-                # Try to extract explicit target UUID from the /resume command
-                TARGET="$(echo "$line" | grep -o '"display":"/resume [^"]*"' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' || true)"
-                if [[ -n "$TARGET" && "$TARGET" != "$CURRENT" ]]; then
-                    echo "$TARGET" > "$MARKER_FILE"
-                    CURRENT="$TARGET"
-                    SAW_RESUME=false
-                fi
-                continue
-            fi
-
-            # After a /resume (interactive picker), the next entry with a
-            # different sessionId is the session the user switched to.
-            if $SAW_RESUME && [[ "$SID" != "$CURRENT" ]]; then
-                echo "$SID" > "$MARKER_FILE"
-                CURRENT="$SID"
-                SAW_RESUME=false
-            fi
-        done < <(tail -n +"$((LAST_LINES + 1))" "$HISTORY_FILE" 2>/dev/null)
-
-        LAST_LINES="$NOW_LINES"
-    done
-) &
-disown
-
-# Run claude in foreground (not exec — so Zellij serializes 'claude-zellij')
-claude --session-id "$CLAUDE_UUID" "$@"
+CLAUDE_CMD=(claude --session-id "$CLAUDE_UUID" "$@")
+start_history_watcher "$MARKER_FILE" "$CLAUDE_UUID"
+launch_claude_with_hotkey "$MARKER" "$@"

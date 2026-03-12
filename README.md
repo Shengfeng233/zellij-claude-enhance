@@ -113,7 +113,7 @@ zellij attach <session-name>
 
 ### What the installer does
 
-1. Copies `claude-zellij`, `codex-zellij`, and `zellij-resurrect-hook.sh` to `~/.local/bin/`
+1. Copies `claude-zellij`, `claude-zellij-pty.py`, `codex-zellij`, and `zellij-resurrect-hook.sh` to `~/.local/bin/`
    - `codex-zellij` is only installed if `codex` is found on PATH
 2. Backs up `~/.config/zellij/config.kdl`
 3. Patches three Zellij config settings:
@@ -158,6 +158,7 @@ Recovery flow:
 ```
 claude-zellij --dangerously-skip-permissions
   → re-exec: claude-zellij --zellij-marker <marker> --dangerously-skip-permissions
+  → proxy:   claude-zellij-pty.py intercepts Ctrl+Y and keeps terminal resize in sync
   → child:   claude --session-id <uuid> --dangerously-skip-permissions
   → watcher: monitors ~/.claude/history.jsonl for /resume
   → Zellij serializes the wrapper command
@@ -165,6 +166,14 @@ claude-zellij --dangerously-skip-permissions
 ```
 
 If you use `/resume` inside Claude to switch conversations, the watcher detects the session change and updates the stored ID. Resurrection lands on the correct conversation.
+
+Hot reboot:
+
+- Focus a `claude-zellij` pane in Zellij normal mode
+- Press `Ctrl+Y`
+- The wrapper terminates the current Claude child and relaunches `claude --resume <current-session-id>`
+- This reloads Claude settings and skills while keeping you in the same conversation
+- The helper keeps terminal resize/redraw state in sync with Zellij so Claude's screen stays stable
 
 ### Codex CLI
 
@@ -232,6 +241,7 @@ zellij -l statusbar-fixed -s test   # try it
 
 ```bash
 bash -n ~/.local/bin/claude-zellij
+python3 -m py_compile ~/.local/bin/claude-zellij-pty.py
 bash -n ~/.local/bin/codex-zellij
 bash -n ~/.local/bin/zellij-resurrect-hook.sh
 ```
@@ -283,6 +293,7 @@ zellij attach test-recovery
 | File | Installed to | Description |
 |---|---|---|
 | `claude-zellij` | `~/.local/bin/claude-zellij` | Claude wrapper with marker UUID + `/resume` tracking |
+| `claude-zellij-pty.py` | `~/.local/bin/claude-zellij-pty.py` | PTY proxy for Claude hot reboot that keeps terminal resize in sync |
 | `codex-zellij` | `~/.local/bin/codex-zellij` | Codex wrapper with marker UUID + session capture + inline mode |
 | `zellij-resurrect-hook.sh` | `~/.local/bin/zellij-resurrect-hook.sh` | Zellij resurrection hook for Claude/Codex commands |
 | `statusbar-fixed.kdl` | `~/.config/zellij/layouts/statusbar-fixed.kdl` | Optional layout with pinned status bar |
@@ -291,7 +302,7 @@ zellij attach test-recovery
 ## Uninstalling
 
 ```bash
-rm ~/.local/bin/claude-zellij ~/.local/bin/codex-zellij ~/.local/bin/zellij-resurrect-hook.sh
+rm ~/.local/bin/claude-zellij ~/.local/bin/claude-zellij-pty.py ~/.local/bin/codex-zellij ~/.local/bin/zellij-resurrect-hook.sh
 rm -rf ~/.local/share/claude-zellij ~/.local/share/codex-zellij
 rm ~/.config/zellij/layouts/statusbar-fixed.kdl  # if installed
 
@@ -315,6 +326,13 @@ Another hook is configured. Either merge the hooks manually or remove the existi
 1. Verify you used `claude-zellij`, not bare `claude`
 2. Check config: `grep -E 'session_serialization|post_command_discovery_hook' ~/.config/zellij/config.kdl`
 3. Test the hook manually (see [Hook tests](#hook-tests))
+
+### Ctrl+Y does not reboot Claude
+
+1. Verify the pane was started with `claude-zellij`, not bare `claude`
+2. Check that `~/.local/bin/claude-zellij-pty.py` exists
+3. Run `python3 -m py_compile ~/.local/bin/claude-zellij-pty.py`
+4. Press `Ctrl+Y` while the Claude pane is focused in Zellij normal mode
 
 ### Codex resumes wrong session
 

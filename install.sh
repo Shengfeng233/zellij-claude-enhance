@@ -77,6 +77,11 @@ if ! command -v uuidgen &>/dev/null; then
     exit 1
 fi
 
+if ! command -v python3 &>/dev/null; then
+    echo "ERROR: python3 not found on PATH (needed by claude-zellij hot reboot support)" >&2
+    exit 1
+fi
+
 # --- Create directories ---
 mkdir -p "$BIN_DIR"
 mkdir -p "$CONFIG_DIR"
@@ -86,6 +91,10 @@ mkdir -p "$LAYOUT_DIR"
 echo "Installing claude-zellij -> $BIN_DIR/claude-zellij"
 cp "$SCRIPT_DIR/claude-zellij" "$BIN_DIR/claude-zellij"
 chmod +x "$BIN_DIR/claude-zellij"
+
+echo "Installing claude-zellij-pty.py -> $BIN_DIR/claude-zellij-pty.py"
+cp "$SCRIPT_DIR/claude-zellij-pty.py" "$BIN_DIR/claude-zellij-pty.py"
+chmod +x "$BIN_DIR/claude-zellij-pty.py"
 
 if command -v codex &>/dev/null; then
     echo "Installing codex-zellij -> $BIN_DIR/codex-zellij"
@@ -155,6 +164,9 @@ syntax_ok=true
 if ! bash -n "$BIN_DIR/claude-zellij"; then
     syntax_ok=false
 fi
+if ! python3 -m py_compile "$BIN_DIR/claude-zellij-pty.py"; then
+    syntax_ok=false
+fi
 if [[ -f "$BIN_DIR/codex-zellij" ]] && ! bash -n "$BIN_DIR/codex-zellij"; then
     syntax_ok=false
 fi
@@ -200,4 +212,5 @@ fi
 echo ""
 echo "=== Installation complete ==="
 echo "Use 'claude-zellij' instead of 'claude' for guaranteed session recovery."
+echo "Inside a claude-zellij pane, press Ctrl+Y to reboot Claude into the same conversation."
 echo "Use 'codex-zellij' instead of 'codex' for best-effort session recovery with inline mode enabled."
