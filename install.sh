@@ -108,13 +108,14 @@ echo "Installing zellij-resurrect-hook.sh -> $HOOK_PATH"
 cp "$SCRIPT_DIR/zellij-resurrect-hook.sh" "$HOOK_PATH"
 chmod +x "$HOOK_PATH"
 
-# --- Optional layout ---
-if $WITH_LAYOUT; then
-    echo "Installing statusbar-fixed.kdl -> $LAYOUT_DIR/statusbar-fixed.kdl"
-    cp "$SCRIPT_DIR/statusbar-fixed.kdl" "$LAYOUT_DIR/statusbar-fixed.kdl"
-    echo "  To test: zellij -l statusbar-fixed"
-    echo "  To make permanent: add 'default_layout \"statusbar-fixed\"' to config.kdl"
-fi
+echo "Installing zellij-fix-statusbar.sh -> $BIN_DIR/zellij-fix-statusbar.sh"
+cp "$SCRIPT_DIR/zellij-fix-statusbar.sh" "$BIN_DIR/zellij-fix-statusbar.sh"
+chmod +x "$BIN_DIR/zellij-fix-statusbar.sh"
+
+# Heal serialized layouts of dead sessions (status-bar resurrection bug).
+# Only touches sessions that are not running; safe to repeat.
+echo "Normalizing serialized session layouts (status-bar fix)..."
+"$BIN_DIR/zellij-fix-statusbar.sh" | sed 's/^/  /'
 
 # --- Patch config.kdl ---
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -154,6 +155,14 @@ echo "Patched: on_force_close \"detach\""
 patch_setting "session_serialization" "true" "$CONFIG_FILE"
 echo "Patched: session_serialization true"
 
+# --- Optional layout ---
+if $WITH_LAYOUT; then
+    echo "Installing statusbar-fixed.kdl -> $LAYOUT_DIR/statusbar-fixed.kdl"
+    cp "$SCRIPT_DIR/statusbar-fixed.kdl" "$LAYOUT_DIR/statusbar-fixed.kdl"
+    patch_setting "default_layout" '"statusbar-fixed"' "$CONFIG_FILE"
+    echo "Patched: default_layout \"statusbar-fixed\" (keeps the status bar pinned)"
+fi
+
 # --- Post-install checks ---
 echo ""
 echo "=== Post-install verification ==="
@@ -171,6 +180,9 @@ if [[ -f "$BIN_DIR/codex-zellij" ]] && ! bash -n "$BIN_DIR/codex-zellij"; then
     syntax_ok=false
 fi
 if ! bash -n "$HOOK_PATH"; then
+    syntax_ok=false
+fi
+if ! bash -n "$BIN_DIR/zellij-fix-statusbar.sh"; then
     syntax_ok=false
 fi
 

@@ -5,6 +5,15 @@
 
 cmd="$RESURRECT_COMMAND"
 
+# Opportunistically heal serialized layouts of other dead sessions so their
+# status bars survive resurrection (see zellij-fix-statusbar.sh). Idempotent,
+# skips running sessions, and runs in the background so the hook stays fast.
+# Everything is silenced: stdout of this hook IS the resurrected command.
+fixer="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/zellij-fix-statusbar.sh"
+if [[ -x "$fixer" ]]; then
+    ("$fixer" >/dev/null 2>&1 &)
+fi
+
 print_cmd() {
     local first=true
     local arg
@@ -17,6 +26,18 @@ print_cmd() {
         fi
     done
     printf '\n'
+}
+
+# Claude stores sessions as ~/.claude/projects/<cwd-slug>/<session-id>.jsonl.
+# A stored ID can stop resolving: Claude's cleanup deletes sessions after
+# ~30 days, and a session that never received a message is never written.
+session_file_exists() {
+    [[ -n "${1:-}" ]] || return 1
+    compgen -G "$HOME/.claude/projects/*/${1}.jsonl" > /dev/null 2>&1
+}
+
+is_uuid() {
+    [[ "${1:-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
 }
 
 codex_flag_takes_value() {
@@ -40,34 +61,96 @@ build_codex_resume_last() {
     print_cmd "${args[@]}"
 }
 
+# --- claude-zellij PTY proxy ---
+# claude-zellij execs into claude-zellij-pty.py (Ctrl+Y hot reboot), so Zellij
+# discovers the proxy as the pane command and serializes something like:
+#   python3 .../claude-zellij-pty.py --wrapper .../claude-zellij --marker <uuid> [args...] -- claude --session-id <stale-id>
+# Re-running that verbatim would relaunch the stale child command (whose
+# --session-id is already in use), so rewrite it back to the wrapper, which
+# re-reads the marker file and resumes the live session.
+# This case must precede the wrapper passthrough below: the proxy command line
+# contains ".../claude-zellij " (the --wrapper value) and would match it.
+case "$cmd" in
+    *claude-zellij-pty.py\ *)
+        read -ra words <<< "$cmd"
+        wrapper=""
+        marker=""
+        wrapper_args=()
+        for ((i = 0; i < ${#words[@]}; i++)); do
+            case "${words[i]}" in
+                --wrapper)
+                    wrapper="${words[i + 1]:-}"
+                    i=$((i + 1))
+                    ;;
+                --marker)
+                    marker="${words[i + 1]:-}"
+                    i=$((i + 1))
+                    ;;
+                --)
+                    break
+                    ;;
+                *)
+                    # Words between "--marker <id>" and "--" are wrapper args
+                    if [[ -n "$marker" ]]; then
+                        wrapper_args+=("${words[i]}")
+                    fi
+                    ;;
+            esac
+        done
+        if [[ -n "$wrapper" && -n "$marker" ]]; then
+            print_cmd "$wrapper" --zellij-marker "$marker" "${wrapper_args[@]}"
+            exit 0
+        fi
+        echo "$cmd"
+        exit 0
+        ;;
+esac
+
 # --- Claude ---
 # Guaranteed recovery: claude --session-id <uuid> → claude --resume <uuid>
 # Best-effort:        bare "claude" → claude --continue
+# Either form falls back to --continue when the stored session no longer
+# resolves, instead of letting claude die with "No conversation found".
 case "$cmd" in
     claude\ *)
         read -ra words <<< "$cmd"
 
-        # Look for --session-id and extract the UUID
-        found=false
-        uuid=""
+        session_id=""
+        resume_id=""
         rest=()
-        skip_next=false
         for ((i = 1; i < ${#words[@]}; i++)); do
-            if $skip_next; then
-                skip_next=false
-                continue
-            fi
-            if [[ "${words[i]}" == "--session-id" && $((i + 1)) -lt ${#words[@]} ]]; then
-                uuid="${words[i + 1]}"
-                found=true
-                skip_next=true
-            else
-                rest+=("${words[i]}")
-            fi
+            arg="${words[i]}"
+            case "$arg" in
+                --session-id)
+                    if [[ -n "${words[i + 1]:-}" ]]; then
+                        session_id="${words[i + 1]}"
+                        i=$((i + 1))
+                    fi
+                    ;;
+                -r|--resume)
+                    if is_uuid "${words[i + 1]:-}"; then
+                        resume_id="${words[i + 1]}"
+                        i=$((i + 1))
+                    else
+                        # Picker form (no value) or named session: keep as-is
+                        rest+=("$arg")
+                    fi
+                    ;;
+                *)
+                    rest+=("$arg")
+                    ;;
+            esac
         done
 
-        if $found && [[ -n "$uuid" ]]; then
-            print_cmd claude --resume "$uuid" "${rest[@]}"
+        target="$session_id"
+        [[ -z "$target" ]] && target="$resume_id"
+
+        if [[ -n "$target" ]]; then
+            if session_file_exists "$target"; then
+                print_cmd claude --resume "$target" "${rest[@]}"
+            else
+                print_cmd claude --continue "${rest[@]}"
+            fi
             exit 0
         fi
         ;;

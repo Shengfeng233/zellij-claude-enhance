@@ -7,9 +7,12 @@
 #      so Zellij serializes the marker in the pane command.
 #   2. Starts claude --session-id <uuid> as a child process (not exec), which
 #      prevents MCP child processes from being discovered by Zellij instead of claude.
-#   3. A background watcher monitors ~/.claude/history.jsonl for /resume commands.
-#      When the user switches sessions via /resume, the watcher updates the stored
-#      session ID so resurrection lands on the correct conversation.
+#   3. A background watcher polls ~/.claude/sessions/<pid>.json — the claude
+#      process's own session registry — and updates the stored session ID the
+#      moment the active session changes (/resume picker, /resume <name>, /clear),
+#      so resurrection lands on the correct conversation even if no message is
+#      typed after switching. Falls back to a history.jsonl heuristic on claude
+#      versions without the registry.
 #   4. On resurrection or Ctrl+Y reboot, the wrapper reads the stored session ID
 #      and runs claude --resume <session-id>.
 
@@ -24,11 +27,28 @@ readonly SUBCOMMANDS="auth mcp doctor update upgrade setup-token install agents 
 # Flags that indicate non-default invocations we should not inject into
 readonly PASSTHROUGH_FLAGS="-c --continue -r --resume --session-id -p --print -h --help -v --version"
 
-start_history_watcher() {
+# Claude stores sessions as ~/.claude/projects/<cwd-slug>/<session-id>.jsonl.
+# A stored ID stops resolving when Claude's cleanup deletes old sessions
+# (~30 days) or when the session never received a message (file never written).
+# Resuming such an ID makes claude exit with "No conversation found".
+session_file_exists() {
+    [[ -n "${1:-}" ]] || return 1
+    compgen -G "$HOME/.claude/projects/*/${1}.jsonl" > /dev/null 2>&1
+}
+
+# --- Session tracking --------------------------------------------------------
+# Primary: poll ~/.claude/sessions/<pid>.json — a registry each claude process
+# keeps for itself (keyed by its own PID) and rewrites in place whenever its
+# active session changes (/resume picker, /resume <name-or-uuid>, /clear).
+# We read the entry of OUR claude child, so tracking is pane-exact, immediate,
+# and does not depend on the user typing a message after switching sessions.
+# Fallback: tail ~/.claude/history.jsonl for /resume events (claude versions
+# without the sessions registry); that heuristic only detects a switch once
+# the next prompt is typed in the new session.
+
+start_session_watcher() {
     local marker_file="$1"
     local initial_session_id="$2"
-    local history_file="$HOME/.claude/history.jsonl"
-    local wrapper_pid="$$"
     local watcher_pid_file="${marker_file}.watcher"
     local existing_watcher_pid=""
 
@@ -39,51 +59,109 @@ start_history_watcher() {
         fi
     fi
 
-    (
-        trap '' INT TERM HUP  # Don't die from signals meant for claude
-        local current="$initial_session_id"
-        local last_lines
-        local saw_resume=false
-        local now_lines
-        local line
-        local sid
-        local target
-
-        last_lines="$(wc -l < "$history_file" 2>/dev/null || echo 0)"
-
-        while kill -0 "$wrapper_pid" 2>/dev/null; do
-            sleep 3
-            now_lines="$(wc -l < "$history_file" 2>/dev/null || echo 0)"
-            [[ "$now_lines" -le "$last_lines" ]] && continue
-
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                sid="$(echo "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | sed 's/"sessionId":"//;s/"//')"
-                [[ -z "$sid" ]] && continue
-
-                if [[ "$sid" == "$current" ]] && echo "$line" | grep -q '"display":"/resume'; then
-                    saw_resume=true
-                    target="$(echo "$line" | grep -o '"display":"/resume [^"]*"' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' || true)"
-                    if [[ -n "$target" && "$target" != "$current" ]]; then
-                        echo "$target" > "$marker_file"
-                        current="$target"
-                        saw_resume=false
-                    fi
-                    continue
-                fi
-
-                if $saw_resume && [[ "$sid" != "$current" ]]; then
-                    echo "$sid" > "$marker_file"
-                    current="$sid"
-                    saw_resume=false
-                fi
-            done < <(tail -n +"$((last_lines + 1))" "$history_file" 2>/dev/null)
-
-            last_lines="$now_lines"
-        done
-    ) &
+    if [[ -d "$HOME/.claude/sessions" ]]; then
+        _watch_session_registry "$marker_file" "$initial_session_id" "$$" &
+    else
+        _watch_history_jsonl "$marker_file" "$initial_session_id" "$$" &
+    fi
     echo "$!" > "$watcher_pid_file"
     disown
+}
+
+_is_descendant() {
+    local p="$1" ancestor="$2" depth=0
+    while [[ "$p" =~ ^[0-9]+$ && "$p" -gt 1 && "$depth" -lt 15 ]]; do
+        [[ "$p" == "$ancestor" ]] && return 0
+        p="$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)"
+        depth=$((depth + 1))
+    done
+    return 1
+}
+
+_watch_session_registry() {
+    local marker_file="$1"
+    local current="$2"
+    local wrapper_pid="$3"  # the wrapper execs the PTY proxy, so this pid IS the proxy
+    local registry="$HOME/.claude/sessions"
+    trap '' INT TERM HUP  # Don't die from signals meant for claude
+    set +e
+    local child sid f cand
+    while kill -0 "$wrapper_pid" 2>/dev/null; do
+        sleep 1
+        # claude runs as the direct child of the proxy; re-resolve every tick
+        # because a Ctrl+Y reboot replaces the child. Skip our own subshell,
+        # which is also a child of the same pid.
+        f=""
+        for child in $(pgrep -P "$wrapper_pid" 2>/dev/null); do
+            [[ "$child" == "$BASHPID" ]] && continue
+            [[ -f "$registry/${child}.json" ]] && { f="$registry/${child}.json"; break; }
+        done
+        if [[ -z "$f" ]]; then
+            # Shim layouts where claude is a deeper descendant of the proxy
+            for cand in "$registry"/*.json; do
+                [[ -e "$cand" ]] || continue
+                child="${cand##*/}"
+                child="${child%.json}"
+                [[ "$child" =~ ^[0-9]+$ ]] || continue
+                [[ "$child" == "$BASHPID" ]] && continue
+                kill -0 "$child" 2>/dev/null || continue
+                _is_descendant "$child" "$wrapper_pid" && { f="$cand"; break; }
+            done
+            [[ -z "$f" ]] && continue
+        fi
+        sid="$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)"
+        [[ -z "$sid" || "$sid" == "$current" ]] && continue
+        echo "$sid" > "$marker_file"
+        current="$sid"
+    done
+}
+
+_watch_history_jsonl() {
+    local marker_file="$1"
+    local current="$2"
+    local wrapper_pid="$3"
+    local history_file="$HOME/.claude/history.jsonl"
+    trap '' INT TERM HUP  # Don't die from signals meant for claude
+    set +e
+    local last_lines
+    local saw_resume=false
+    local now_lines
+    local line
+    local sid
+    local target
+
+    last_lines="$(wc -l < "$history_file" 2>/dev/null || echo 0)"
+
+    while kill -0 "$wrapper_pid" 2>/dev/null; do
+        sleep 3
+        now_lines="$(wc -l < "$history_file" 2>/dev/null || echo 0)"
+        [[ "$now_lines" -le "$last_lines" ]] && continue
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            sid="$(echo "$line" | grep -o '"sessionId":"[^"]*"' | head -1 | sed 's/"sessionId":"//;s/"//')"
+            [[ -z "$sid" ]] && continue
+
+            if [[ "$sid" == "$current" ]] && echo "$line" | grep -q '"display":"/resume'; then
+                saw_resume=true
+                target="$(echo "$line" | grep -o '"display":"/resume [^"]*"' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' || true)"
+                if [[ -n "$target" && "$target" != "$current" ]]; then
+                    echo "$target" > "$marker_file"
+                    current="$target"
+                    saw_resume=false
+                fi
+                continue
+            fi
+
+            if $saw_resume && [[ "$sid" != "$current" ]]; then
+                echo "$sid" > "$marker_file"
+                current="$sid"
+                saw_resume=false
+            fi
+        done < <(tail -n +"$((last_lines + 1))" "$history_file" 2>/dev/null)
+
+        last_lines="$now_lines"
+    done
 }
 
 launch_claude_with_hotkey() {
@@ -133,20 +211,25 @@ fi
 mkdir -p "$MARKER_DIR"
 MARKER_FILE="$MARKER_DIR/$MARKER"
 
+# GC markers of long-dead panes; Claude's own cleanup has removed their
+# sessions anyway, so they could only ever produce a failed resume.
+find "$MARKER_DIR" -type f -mtime +45 -delete 2>/dev/null || true
+
 # --- Resume existing marker or start a fresh Claude session ---
 if [[ -f "$MARKER_FILE" ]]; then
     SESSION_ID="$(cat "$MARKER_FILE")"
-    if [[ -n "$SESSION_ID" ]]; then
-        CLAUDE_CMD=(claude --resume "$SESSION_ID")
-        start_history_watcher "$MARKER_FILE" "$SESSION_ID"
+    if session_file_exists "$SESSION_ID"; then
+        CLAUDE_CMD=(claude --resume "$SESSION_ID" "$@")
+        start_session_watcher "$MARKER_FILE" "$SESSION_ID"
         launch_claude_with_hotkey "$MARKER" "$@"
     fi
-    CLAUDE_CMD=(claude --continue)
-    launch_claude_with_hotkey "$MARKER" "$@"
+    if [[ -n "$SESSION_ID" ]]; then
+        echo "[claude-zellij] stored session $SESSION_ID not found (expired or never used) - starting fresh" >&2
+    fi
 fi
 
 CLAUDE_UUID="$(uuidgen)"
 echo "$CLAUDE_UUID" > "$MARKER_FILE"
 CLAUDE_CMD=(claude --session-id "$CLAUDE_UUID" "$@")
-start_history_watcher "$MARKER_FILE" "$CLAUDE_UUID"
+start_session_watcher "$MARKER_FILE" "$CLAUDE_UUID"
 launch_claude_with_hotkey "$MARKER" "$@"
