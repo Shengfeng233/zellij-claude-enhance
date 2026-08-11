@@ -5,7 +5,7 @@
 # Unlike Claude, Codex doesn't support --session-id. This wrapper works around
 # that by:
 #   1. Generating a marker UUID and embedding it in its own command line (re-exec)
-#   2. Capturing the Codex session ID from session_index.jsonl in the background
+#   2. Capturing the Codex session ID from session_index.jsonl or history.jsonl
 #   3. On resurrection, looking up the stored session ID and running codex resume
 #
 # Zellij serializes the pane command. If it discovers "codex-zellij --zellij-marker
@@ -211,25 +211,48 @@ if [[ -f "$MARKER_FILE" ]]; then
 fi
 
 # --- Fresh start: capture session ID in background, then run codex ---
-INDEX_FILE="$HOME/.codex/session_index.jsonl"
-BEFORE="$(wc -l < "$INDEX_FILE" 2>/dev/null || echo 0)"
-TARGET_LINE=$((BEFORE + 1))
+# Codex records session ids in either of two files depending on version:
+#   older: ~/.codex/session_index.jsonl  (lines like {"id":"..."})
+#   newer: ~/.codex/history.jsonl         (lines like {"session_id":"..."})
+# We handle both: snapshot the union of known ids before launch, then poll
+# for a NEW id appearing in either file after codex starts.
+INDEX_FILES=(
+    "$HOME/.codex/session_index.jsonl"
+    "$HOME/.codex/history.jsonl"
+)
 
-# Background watcher: polls for new session entry and stores the session ID
+extract_session_ids() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    grep -oE '"(session_id|id)":"[^"]*"' "$file" 2>/dev/null \
+        | sed 's/.*":"//; s/"$//' \
+        | sort -u || true
+}
+
+BEFORE_IDS="$(mktemp)"
+for f in "${INDEX_FILES[@]}"; do
+    extract_session_ids "$f" >> "$BEFORE_IDS"
+done
+sort -u "$BEFORE_IDS" -o "$BEFORE_IDS"
+
+# Background watcher: polls for a new session_id and stores it
 (
     trap '' INT TERM HUP  # Don't die from signals meant for codex
     for _ in $(seq 1 120); do
-        CURRENT="$(wc -l < "$INDEX_FILE" 2>/dev/null || echo 0)"
-        if [[ "$CURRENT" -ge "$TARGET_LINE" ]]; then
-            SESSION_ID="$(sed -n "${TARGET_LINE}p" "$INDEX_FILE" 2>/dev/null \
-                | grep -o '"id":"[^"]*"' | head -1 | sed 's/"id":"//;s/"//')"
-            if [[ -n "$SESSION_ID" ]]; then
-                echo "$SESSION_ID" > "$MARKER_FILE"
-            fi
+        CURRENT="$(mktemp)"
+        for f in "${INDEX_FILES[@]}"; do
+            extract_session_ids "$f" >> "$CURRENT"
+        done
+        sort -u "$CURRENT" -o "$CURRENT"
+        NEW_ID="$(comm -23 "$CURRENT" "$BEFORE_IDS" | head -1 || true)"
+        rm -f "$CURRENT"
+        if [[ -n "$NEW_ID" ]]; then
+            echo "$NEW_ID" > "$MARKER_FILE"
             break
         fi
         sleep 0.5
     done
+    rm -f "$BEFORE_IDS"
 ) &
 disown
 
