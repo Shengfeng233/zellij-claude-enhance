@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# opencode-zellij
+# Start opencode TUI sessions inside Zellij with per-pane recovery.
+#
+# opencode cannot take a custom session ID upfront (-s/--session only resumes
+# existing sessions), so this wrapper follows the codex pattern:
+#   1. Generate a marker UUID, re-exec with --zellij-marker <uuid> baked in.
+#   2. Start opencode as a CHILD (not exec) so Zellij serializes the wrapper.
+#   3. A background watcher captures the session ID opencode mints (via
+#      `opencode session list`) and stores it keyed by the marker.
+#   4. On resurrection, the wrapper reads the stored ID, verifies it still
+#      exists, and runs `opencode -s <id>`.
+#
+# Unlike codex, opencode supports exact per-session resume (-s <id>), so
+# recovery is per-pane exact, not best-effort --last.
+
+set -euo pipefail
+
+MARKER_DIR="$HOME/.local/share/opencode-zellij/markers"
+
+# Subcommands that pass through unchanged (everything except the bare TUI).
+readonly SUBCOMMANDS="completion acp mcp attach run debug providers auth agent upgrade uninstall serve web models stats export import github pr session plugin plug db"
+
+# Flags that indicate an explicit resume/continue or info query — bypass marker.
+readonly PASSTHROUGH_FLAGS="-c --continue -s --session --fork -h --help -v --version"
+
+# Flags that consume the following argument as their value (used when scanning
+# for the first non-flag positional, so we don't mistake a value for a subcommand).
+opencode_flag_takes_value() {
+    case "$1" in
+        -m|--model|--prompt|--agent|--port|--hostname|--mdns-domain|--cors|--log-level|--replay-limit|--variant)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+contains_word() {
+    local needle="$1"
+    shift
+    local item
+    for item in $*; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+# --- opencode session helpers ---
+# opencode session list --format json → [{"id","directory","created","updated",...}]
+# python3 is already a repo dependency (claude-zellij-pty.py); use it for robust
+# JSON parsing instead of fragile grep/sed on JSON.
+
+# session_exists <id>: true if id is present in opencode's session list.
+# opencode's `session list` omits archived sessions in practice, so presence
+# implies the session is live and resumable. A broken `session list` (non-zero
+# exit, non-list JSON) also falls through as "not found"; the fresh path's own
+# `opencode` invocation will then surface any genuine errors.
+session_exists() {
+    [[ -n "${1:-}" ]] || return 1
+    # NOTE: the env-var prefix must sit on python3 (the pipe stage that reads
+    # it). Prefixing the whole pipeline would set it only for opencode (stage 1);
+    # python3 would then KeyError. See bash "command execution environment".
+    opencode session list --format json 2>/dev/null | OPENCODE_LOOKUP_ID="$1" python3 -c '
+import json, os, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, list):
+    sys.exit(1)
+target = os.environ["OPENCODE_LOOKUP_ID"]
+sys.exit(0 if any(s.get("id") == target for s in data) else 1)
+'
+}
+
+# newest_session_after <cwd> <launch_ms>: print the newest session id whose
+# directory == <cwd> AND created >= <launch_ms>, or empty if none. Used by the
+# fresh-path watcher to find the session opencode just minted (and avoid grabbing
+# a pre-existing session in the same CWD from a prior run).
+#
+# Single opencode-list + python pass. The env-var prefix MUST sit on python3
+# (the pipeline's second stage) — a prefix on `opencode` would not reach python.
+newest_session_after() {
+    local cwd="$1" launch_ms="$2"
+    opencode session list --format json 2>/dev/null | OPENCODE_FILTER_CWD="$cwd" OPENCODE_AFTER="$launch_ms" python3 -c '
+import json, os, sys
+try:
+    data = json.load(sys.stdin)
+    if not isinstance(data, list):
+        sys.exit(0)
+    cwd = os.environ["OPENCODE_FILTER_CWD"]
+    after = int(os.environ["OPENCODE_AFTER"])
+    cands = [s for s in data
+             if s.get("directory") == cwd
+             and int(s.get("created", 0) or 0) >= after]
+    if cands:
+        print(max(cands, key=lambda s: int(s.get("created", 0) or 0))["id"])
+except Exception:
+    sys.exit(0)
+'
+}
+
+# start_session_watcher <marker_file> <cwd> <launch_ms> <wrapper_pid>
+# Background subshell that polls until it finds a session created at/after
+# launch_ms in <cwd>, writes its id to the marker file, and exits.
+# trap '' INT TERM HUP so signals meant for opencode don't kill the watcher.
+start_session_watcher() {
+    local marker_file="$1"
+    local cwd="$2"
+    local launch_ms="$3"
+    local wrapper_pid="$4"
+    (
+        trap '' INT TERM HUP
+        set +e
+        local _ sid
+        for _ in $(seq 1 200); do
+            kill -0 "$wrapper_pid" 2>/dev/null || exit 0
+            sid="$(newest_session_after "$cwd" "$launch_ms")"
+            if [[ -n "$sid" ]]; then
+                echo "$sid" > "$marker_file"
+                exit 0
+            fi
+            sleep 3
+        done
+        echo "[opencode-zellij] gave up waiting for opencode session (idle > ~10 min?) - this pane will not resume after a crash" >&2
+    ) &
+    disown
+}
+
+# --- Parse --zellij-marker (our internal flag, not an opencode flag) ---
+MARKER=""
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--zellij-marker" && -n "${2:-}" ]]; then
+        MARKER="$2"
+        shift 2
+    else
+        ARGS+=("$1")
+        shift
+    fi
+done
+set -- "${ARGS[@]}"
+
+# --- Check for passthrough flags and subcommands ---
+args=("$@")
+first_non_flag=""
+skip_next=false
+for ((i = 0; i < ${#args[@]}; i++)); do
+    arg="${args[i]}"
+
+    if $skip_next; then
+        skip_next=false
+        continue
+    fi
+
+    for flag in $PASSTHROUGH_FLAGS; do
+        [[ "$arg" == "$flag" ]] && exec opencode "${args[@]}"
+    done
+
+    case "$arg" in
+        --)
+            if ((i + 1 < ${#args[@]})); then
+                first_non_flag="${args[i + 1]}"
+            fi
+            break
+            ;;
+        --*=*)
+            ;;
+        -*)
+            if opencode_flag_takes_value "$arg"; then
+                skip_next=true
+            fi
+            ;;
+        *)
+            first_non_flag="$arg"
+            break
+            ;;
+    esac
+done
+
+if [[ -n "$first_non_flag" ]] && contains_word "$first_non_flag" "$SUBCOMMANDS"; then
+    exec opencode "${args[@]}"
+fi
+
+# --- First invocation: generate marker and re-exec to embed it ---
+if [[ -z "$MARKER" ]]; then
+    MARKER="$(uuidgen)"
+    exec "$0" --zellij-marker "$MARKER" "$@"
+fi
+
+mkdir -p "$MARKER_DIR"
+MARKER_FILE="$MARKER_DIR/$MARKER"
+
+# GC markers of long-dead panes; opencode's own archival has removed their
+# sessions anyway.
+find "$MARKER_DIR" -type f -mtime +45 -delete 2>/dev/null || true
+
+# --- Resume path: marker file exists with a stored session ID ---
+if [[ -f "$MARKER_FILE" ]]; then
+    SESSION_ID="$(cat "$MARKER_FILE" 2>/dev/null || true)"
+    if [[ -n "$SESSION_ID" ]] && session_exists "$SESSION_ID"; then
+        exec opencode -s "$SESSION_ID" "$@"
+    fi
+    if [[ -n "$SESSION_ID" ]]; then
+        echo "[opencode-zellij] stored session $SESSION_ID not found (archived/expired) - starting fresh" >&2
+    fi
+    # Fall through to fresh start; the fresh path will overwrite the marker file.
+fi
+
+# --- Fresh start: spawn watcher, run opencode as a foreground child ---
+# NOT exec — the wrapper must stay alive as pane leader so Zellij serializes
+# "opencode-zellij --zellij-marker <uuid> ..." rather than the child opencode.
+LAUNCH_MS="$(date +%s%3N)"
+CWD="$(pwd)"
+start_session_watcher "$MARKER_FILE" "$CWD" "$LAUNCH_MS" "$$"
+
+# Touch the marker file so it exists even before capture completes (the resume
+# path keys off file existence). An empty file means "capture pending".
+: > "$MARKER_FILE"
+
+opencode "$@"

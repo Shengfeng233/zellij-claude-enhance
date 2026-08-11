@@ -1,23 +1,25 @@
 # zellij-claude-enhance
 
-Automatic session recovery for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex) running inside [Zellij](https://zellij.dev/).
+Automatic session recovery for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), and [opencode](https://opencode.ai/) running inside [Zellij](https://zellij.dev/).
 
 ## The Problem
 
-If you run multiple Claude Code or Codex instances across Zellij tabs and panes, an unexpected WSL shutdown, terminal crash, or `pkill -9 zellij` wipes out every conversation. Zellij can resurrect panes and re-run the last command in each, but by default it just runs `claude` or `codex` again — starting a fresh session instead of resuming the one you were working in.
+If you run multiple Claude Code, Codex, or opencode instances across Zellij tabs and panes, an unexpected WSL shutdown, terminal crash, or `pkill -9 zellij` wipes out every conversation. Zellij can resurrect panes and re-run the last command in each, but by default it just runs `claude` or `codex` again — starting a fresh session instead of resuming the one you were working in.
 
 With 8+ AI panes open, reconnecting each one manually is painful.
 
 ## The Solution
 
-Two thin wrapper scripts — `claude-zellij` and `codex-zellij` — plus a Zellij resurrection hook that together give you **per-pane session recovery** and **in-place hot reboot**:
+Three thin wrapper scripts — `claude-zellij`, `codex-zellij`, and `opencode-zellij` — plus a Zellij resurrection hook that together give you **per-pane session recovery** and **in-place hot reboot**:
 
 | Tool | Wrapper | Recovery |
 |---|---|---|
 | Claude Code | `claude-zellij` | Per-pane UUID tracking + `/resume` change detection |
 | Codex CLI | `codex-zellij` | Per-pane session capture + inline mode (`--no-alt-screen`) |
+| opencode | `opencode-zellij` | Per-pane session capture + exact `opencode -s <id>` resume |
 | Bare `claude` | (none needed) | Best-effort fallback via `claude --continue` |
 | Bare `codex` | (none needed) | Best-effort fallback via `codex resume --last` |
+| Bare `opencode` | (none needed) | Best-effort fallback via `opencode -c` |
 
 If a stored session ID no longer resolves — Claude Code deletes sessions after ~30 days, and a session that never received a message is never written to disk — recovery degrades gracefully (`claude --continue` for bare claude, a fresh tracked session for `claude-zellij`) instead of dying with `No conversation found with session ID`.
 
@@ -102,7 +104,7 @@ Because the wrapper `exec`s into the PTY proxy, the proxy is the process Zellij 
 ## Prerequisites
 
 - [Zellij](https://zellij.dev/) 0.43+
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`) and/or [Codex CLI](https://github.com/openai/codex) (`codex`)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`) and/or [Codex CLI](https://github.com/openai/codex) (`codex`), and/or [opencode](https://opencode.ai/) (`opencode`) — each wrapper is installed only when its CLI is on PATH
 - Python 3 (for the Ctrl+Y hot reboot PTY proxy)
 - `uuidgen` (pre-installed on most Linux distributions)
 - Bash 4+
@@ -142,8 +144,9 @@ zellij attach <session-name>
 
 ### What the installer does
 
-1. Copies `claude-zellij`, `claude-zellij-pty.py`, `codex-zellij`, `zellij-resurrect-hook.sh`, and `zellij-fix-statusbar.sh` to `~/.local/bin/`
+1. Copies `claude-zellij`, `claude-zellij-pty.py`, `codex-zellij`, `opencode-zellij`, `zellij-resurrect-hook.sh`, and `zellij-fix-statusbar.sh` to `~/.local/bin/`
    - `codex-zellij` is only installed if `codex` is found on PATH
+   - `opencode-zellij` is only installed if `opencode` is found on PATH
 2. Normalizes serialized layouts of dead sessions (`zellij-fix-statusbar.sh`) so their status bars survive resurrection
 3. Backs up `~/.config/zellij/config.kdl`
 4. Patches three Zellij config settings:
@@ -233,12 +236,41 @@ codex-zellij --full-auto
   → crash → reattach → wrapper reads marker → codex resume <session-id> --no-alt-screen
 ```
 
+### opencode CLI
+
+```bash
+# Per-pane recovery — session id captured automatically:
+opencode-zellij
+opencode-zellij -m anthropic/claude-sonnet-4.5
+opencode-zellij /path/to/project
+
+# Pass-through (no marker, no recovery):
+opencode-zellij -s <existing-id>
+opencode-zellij -c
+opencode-zellij run "one-shot prompt"
+opencode-zellij mcp list
+```
+
+Recovery flow:
+
+```
+opencode-zellij -m sonnet
+  → re-exec:  opencode-zellij --zellij-marker <uuid> -m sonnet
+  → child:    opencode -m sonnet  (NOT exec, so wrapper stays pane leader)
+  → watcher:  captures ses_xxx from `opencode session list` (directory==CWD, created>=launch)
+  → crash → reattach → wrapper reads marker → verifies ses_xxx → opencode -s ses_xxx
+```
+
+If the stored session was archived or expired, the wrapper starts a fresh
+tracked session and overwrites the marker file instead of failing.
+
 ### Bare CLI fallback
 
 Commands run without the wrapper still get best-effort recovery:
 
 - `claude` → `claude --continue` (resumes most recent conversation in CWD)
 - `codex` → `codex resume --last --no-alt-screen` (resumes most recent session in CWD, preserves `-C/--cd`)
+- `opencode` → `opencode -c` (continues the most recent session in CWD)
 
 This works for single-pane setups. For multiple AI panes in the same directory, use the wrappers.
 
@@ -251,6 +283,7 @@ npm exec @upstash/context7-mcp   # unchanged
 vim                                # unchanged
 claude -p "one-shot"               # non-interactive, nothing to resume
 codex exec "one-shot"              # non-interactive, nothing to resume
+opencode run "one-shot"             # non-interactive, nothing to resume
 ```
 
 ## Status-Bar Pinning
@@ -311,6 +344,17 @@ RESURRECT_COMMAND="codex" ~/.local/bin/zellij-resurrect-hook.sh
 RESURRECT_COMMAND="codex exec do something" ~/.local/bin/zellij-resurrect-hook.sh
 # → codex exec do something  (unchanged)
 
+# opencode
+RESURRECT_COMMAND="opencode" ~/.local/bin/zellij-resurrect-hook.sh
+# → opencode -c
+
+RESURRECT_COMMAND="opencode-zellij --zellij-marker 33333333-3333-3333-3333-333333333333" \
+  ~/.local/bin/zellij-resurrect-hook.sh
+# → unchanged
+
+RESURRECT_COMMAND="opencode run do something" ~/.local/bin/zellij-resurrect-hook.sh
+# → opencode run do something  (unchanged)
+
 # Other
 RESURRECT_COMMAND="npm exec @upstash/context7-mcp" ~/.local/bin/zellij-resurrect-hook.sh
 # → npm exec @upstash/context7-mcp  (unchanged)
@@ -342,6 +386,7 @@ zellij attach test-recovery
 | `claude-zellij` | `~/.local/bin/claude-zellij` | Claude wrapper with marker UUID + `/resume` tracking |
 | `claude-zellij-pty.py` | `~/.local/bin/claude-zellij-pty.py` | PTY proxy for Claude hot reboot that keeps terminal resize in sync |
 | `codex-zellij` | `~/.local/bin/codex-zellij` | Codex wrapper with marker UUID + session capture + inline mode |
+| `opencode-zellij` | `~/.local/bin/opencode-zellij` | opencode wrapper with marker UUID + session capture |
 | `zellij-resurrect-hook.sh` | `~/.local/bin/zellij-resurrect-hook.sh` | Zellij resurrection hook for Claude/Codex commands |
 | `zellij-fix-statusbar.sh` | `~/.local/bin/zellij-fix-statusbar.sh` | Heals serialized session layouts so status bars survive resurrection |
 | `statusbar-fixed.kdl` | `~/.config/zellij/layouts/statusbar-fixed.kdl` | Layout with pinned status bar (resurrection-safe plugin URLs) |
@@ -353,6 +398,10 @@ zellij attach test-recovery
 rm ~/.local/bin/claude-zellij ~/.local/bin/claude-zellij-pty.py ~/.local/bin/codex-zellij ~/.local/bin/zellij-resurrect-hook.sh ~/.local/bin/zellij-fix-statusbar.sh
 rm -rf ~/.local/share/claude-zellij ~/.local/share/codex-zellij
 rm ~/.config/zellij/layouts/statusbar-fixed.kdl  # if installed
+
+# Remove opencode-zellij if it was installed (only when opencode is on PATH):
+rm ~/.local/bin/opencode-zellij
+rm -rf ~/.local/share/opencode-zellij
 
 # Restore config from backup
 ls ~/.config/zellij/config.kdl.backup.*  # find your backup
@@ -401,6 +450,29 @@ If Zellij serializes the child process (`codex`) instead of the wrapper (`codex-
 ### Multiple Claude panes resume the same conversation
 
 This happens with bare `claude` (falls back to `--continue`). Use `claude-zellij` for per-pane recovery.
+
+### opencode doesn't resume after crash
+
+1. Verify you used `opencode-zellij`, not bare `opencode`
+2. Check the marker file: `cat ~/.local/share/opencode-zellij/markers/<uuid>` — should contain `ses_...`
+3. Verify the session still exists: `opencode session list | grep <id>`
+4. Re-run the hook test (see [Hook tests](#hook-tests))
+
+### opencode marker file is empty
+
+The background watcher could not capture a session id. This happens if
+opencode did not create a session row within ~10 minutes of the wrapper
+starting (for example, you launched `opencode-zellij` but never sent a
+message, then crashed). The pane will start a fresh tracked session on
+recovery instead of resuming.
+
+### Multiple opencode panes in the same directory resume the same session
+
+If two `opencode-zellij` panes are launched in the same working directory
+within the same poll window, both watchers can capture whichever session
+opencode mints first. On recovery both panes resume that same session. To
+avoid this, launch same-directory panes a few seconds apart, or use distinct
+working directories per pane.
 
 ## License
 
