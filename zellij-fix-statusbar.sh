@@ -15,6 +15,17 @@
 
 set -euo pipefail
 
+# The resurrection hook (zellij-resurrect-hook.sh) launches this script in the
+# background on EVERY command discovery, i.e. many times per second across
+# sessions and panes. Without a guard that is a fork bomb: each instance loops
+# over all session layouts forking a pgrep per session. flock-protect so only
+# one instance does the work; concurrent duplicates exit instantly. Safe because
+# the work is idempotent and anything skipped here is picked up by the next run.
+exec 9>"${TMPDIR:-/tmp}/zellij-fix-statusbar.lock"
+if ! flock -n 9; then
+    exit 0
+fi
+
 shopt -s nullglob
 
 fixed=0
