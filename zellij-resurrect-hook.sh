@@ -164,11 +164,11 @@ esac
 # Both wrappers handle resume internally via --zellij-marker.
 # Pass through unchanged so the wrapper can look up the stored session ID.
 case "$cmd" in
-    claude-zellij\ *|claude-zellij|codex-zellij\ *|codex-zellij)
+    claude-zellij\ *|claude-zellij|codex-zellij\ *|codex-zellij|opencode-zellij\ *|opencode-zellij)
         echo "$cmd"
         exit 0
         ;;
-    */claude-zellij\ *|*/claude-zellij|*/codex-zellij\ *|*/codex-zellij)
+    */claude-zellij\ *|*/claude-zellij|*/codex-zellij\ *|*/codex-zellij|*/opencode-zellij\ *|*/opencode-zellij)
         # Full-path variant (e.g. /home/user/.local/bin/claude-zellij)
         echo "$cmd"
         exit 0
@@ -246,6 +246,81 @@ case "$cmd" in
         ;;
     codex)
         build_codex_resume_last
+        exit 0
+        ;;
+esac
+
+# --- opencode (bare, without wrapper) ---
+# Best-effort: "opencode -c" continues the last session in CWD.
+# Subcommands (run, serve, mcp, etc.) and explicit -s/-c/--fork pass through
+# unchanged. Bare "opencode" and "opencode [project]" get -c injected.
+opencode_subcommands="completion acp mcp attach run debug providers auth agent upgrade uninstall serve web models stats export import github pr session plugin plug db"
+opencode_passthrough_flags="-c --continue -s --session --fork -h --help -v --version"
+
+opencode_flag_takes_value() {
+    case "$1" in
+        -m|--model|--prompt|--agent|--port|--hostname|--mdns-domain|--cors|--log-level|--replay-limit|--variant)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+case "$cmd" in
+    opencode\ *)
+        read -ra words <<< "$cmd"
+        first_non_flag=""
+        skip_next=false
+
+        for ((i = 1; i < ${#words[@]}; i++)); do
+            arg="${words[i]}"
+
+            if $skip_next; then
+                skip_next=false
+                continue
+            fi
+
+            for flag in $opencode_passthrough_flags; do
+                if [[ "$arg" == "$flag" ]]; then
+                    echo "$cmd"
+                    exit 0
+                fi
+            done
+
+            case "$arg" in
+                --)
+                    break
+                    ;;
+                --*=*)
+                    continue
+                    ;;
+                -*)
+                    if opencode_flag_takes_value "$arg"; then
+                        skip_next=true
+                    fi
+                    continue
+                    ;;
+                *)
+                    first_non_flag="$arg"
+                    for subcmd in $opencode_subcommands; do
+                        if [[ "$first_non_flag" == "$subcmd" ]]; then
+                            echo "$cmd"
+                            exit 0
+                        fi
+                    done
+                    break
+                    ;;
+            esac
+        done
+
+        # No passthrough flag/subcommand: inject -c, keep remaining args.
+        print_cmd opencode -c "${words[@]:1}"
+        exit 0
+        ;;
+    opencode)
+        print_cmd opencode -c
         exit 0
         ;;
 esac

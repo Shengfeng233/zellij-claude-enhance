@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh
-# Install Claude/Codex recovery scripts for Zellij session resurrection.
+# Install Claude/Codex/opencode recovery scripts for Zellij session resurrection.
 #
 # Usage:
 #   ./install.sh              Install recovery only
@@ -104,6 +104,14 @@ else
     echo "Skipping codex-zellij (codex not found on PATH)"
 fi
 
+if command -v opencode &>/dev/null; then
+    echo "Installing opencode-zellij -> $BIN_DIR/opencode-zellij"
+    cp "$SCRIPT_DIR/opencode-zellij" "$BIN_DIR/opencode-zellij"
+    chmod +x "$BIN_DIR/opencode-zellij"
+else
+    echo "Skipping opencode-zellij (opencode not found on PATH)"
+fi
+
 echo "Installing zellij-resurrect-hook.sh -> $HOOK_PATH"
 cp "$SCRIPT_DIR/zellij-resurrect-hook.sh" "$HOOK_PATH"
 chmod +x "$HOOK_PATH"
@@ -179,6 +187,9 @@ fi
 if [[ -f "$BIN_DIR/codex-zellij" ]] && ! bash -n "$BIN_DIR/codex-zellij"; then
     syntax_ok=false
 fi
+if [[ -f "$BIN_DIR/opencode-zellij" ]] && ! bash -n "$BIN_DIR/opencode-zellij"; then
+    syntax_ok=false
+fi
 if ! bash -n "$HOOK_PATH"; then
     syntax_ok=false
 fi
@@ -226,3 +237,4 @@ echo "=== Installation complete ==="
 echo "Use 'claude-zellij' instead of 'claude' for guaranteed session recovery."
 echo "Inside a claude-zellij pane, press Ctrl+Y to reboot Claude into the same conversation."
 echo "Use 'codex-zellij' instead of 'codex' for best-effort session recovery with inline mode enabled."
+echo "Use 'opencode-zellij' instead of 'opencode' for per-pane session recovery via opencode -s."

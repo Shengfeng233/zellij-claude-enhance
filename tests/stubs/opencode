@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Stub `opencode` for wrapper tests.
+# - `opencode session list --format json` emits $OPENCODE_STUB_SESSIONS (default [])
+# - any other invocation logs argv to $OPENCODE_STUB_LOG and exits 0
+# This lets tests drive the wrapper without a real opencode TUI.
+
+LOG="${OPENCODE_STUB_LOG:-/dev/null}"
+
+if [[ "${1:-}" == "session" && "${2:-}" == "list" ]]; then
+    printf '%s\n' "${OPENCODE_STUB_SESSIONS:-[]}"
+    exit 0
+fi
+
+# Non-session invocations: log argv so tests can assert what the wrapper ran.
+{
+    if [[ "${1:-}" == "-s" ]]; then
+        echo "RESUME ${2:-}"
+    elif [[ $# -gt 0 ]]; then
+        echo "RUN $*"
+    else
+        echo "RUN"
+    fi
+} >> "$LOG"
+exit 0
