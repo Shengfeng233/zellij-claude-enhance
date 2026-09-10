@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Per-pane session recovery for Claude Code and Codex CLI running inside Zellij, plus a fix for Zellij's status-bar displacement in resurrected sessions. The deliverable is five small scripts + a layout + an installer — there is no build system, no package manager, no test framework. Changes are validated by syntax checks and manual crash-recovery testing.
+Per-pane session recovery for Claude Code and Codex CLI running inside Zellij, plus fixes for scrollback, inherited color settings, and status-bar displacement. The deliverable is small recovery and installation scripts plus a layout. There is no build system or package manager. Changes are validated by syntax checks, Python standard-library regression tests, and manual terminal/crash-recovery testing.
 
 ## Common commands
 
@@ -13,7 +13,10 @@ Per-pane session recovery for Claude Code and Codex CLI running inside Zellij, p
 ./install.sh
 ./install.sh --with-layout   # also installs statusbar-fixed.kdl
 
-# Syntax checks (the only automated validation)
+# Color environment regressions:
+python3 -m unittest discover -s tests -v
+
+# Syntax checks:
 bash -n claude-zellij
 bash -n codex-zellij
 bash -n zellij-resurrect-hook.sh
@@ -59,7 +62,7 @@ Matching order matters:
 1. `... claude-zellij-pty.py --wrapper <path> --marker <uuid> [args] -- claude ...` → `<wrapper> --zellij-marker <uuid> [args]`. This is the normal serialized form of a claude-zellij pane (the proxy is the pane leader) and **must be matched before rule 3**: the proxy command line contains `.../claude-zellij ` as the `--wrapper` value, so rule 3's glob would otherwise pass it through verbatim and replay the stale `claude --session-id` child command.
 2. `claude --session-id <uuid> ...` / `claude --resume <uuid> ...` → `claude --resume <uuid> ...` if `~/.claude/projects/*/<uuid>.jsonl` exists, else `claude --continue ...`. Bare `claude` → `claude --continue` (best-effort, per-CWD).
 3. `claude-zellij ...` / `codex-zellij ...` (including full-path variants) → passed through unchanged so the wrapper's own marker logic runs.
-4. `codex [flags] [subcommand] ...` → if a known non-resume subcommand is present, pass through; otherwise build `codex resume --last [--cd X] --no-alt-screen`, preserving `-C/--cd` because `resume --last` is CWD-scoped.
+4. `codex [flags] [subcommand] ...` → if a known non-resume subcommand is present, pass through; preserve explicit resume/fork with inline mode enabled; otherwise build `codex resume --last [--cd X] --no-alt-screen`, preserving `-C/--cd` because `resume --last` is CWD-scoped.
 5. Everything else → unchanged.
 
 The hook also fires `zellij-fix-statusbar.sh` in the background (silenced — the hook's stdout IS the resurrected command) to heal other dead sessions' serialized layouts.
@@ -84,7 +87,7 @@ To reproduce/verify: start a session, open ~6 panes, `kill -9` its server (never
 
 ## Installer invariants
 
-`install.sh` patches three settings in `~/.config/zellij/config.kdl`: `on_force_close "detach"`, `session_serialization true`, `post_command_discovery_hook "<path>"`. All three are required for the recovery loop; removing any one silently breaks recovery. With `--with-layout` it additionally sets `default_layout "statusbar-fixed"`. It always installs and runs `zellij-fix-statusbar.sh` (safe: only touches dead sessions' caches).
+`install.sh` patches recovery settings in `~/.config/zellij/config.kdl`: `on_force_close "detach"`, `session_serialization true`, `post_command_discovery_hook "<path>"`. All three are required for the recovery loop; removing any one silently breaks recovery. It also enables `mouse_mode true` and removes the obsolete managed scroll-shortcut block from earlier installations. Codex scrolling with normal rich output requires Zellij >= 0.44.1; tested with 0.45.1. `upgrade-zellij.sh` installs a pinned, checksum-verified release and `zellij-dispatch` routes actions inside old sessions to their ancestor server executable. Servers cannot be upgraded by detach/reattach; migrate into a new server while retaining old processes. Do not force `tui.raw_output_mode=true`: it expands tool output and sacrifices the compact display the user wants. Test actual multi-screen conversation history, not shell output printed before Codex starts. With `--with-layout` it additionally sets `default_layout "statusbar-fixed"`. It always installs and runs `zellij-fix-statusbar.sh` (safe: only touches dead sessions' caches), which uses `zellij-layout-repair.py` and backs up changed files. The dispatcher also runs it before loading saved sessions. Besides plugin aliases it repairs the stock bare `new_tab_template { pane cwd="/" }` and removes the dump's top-level common-root cwd after making saved paths absolute. Both defects must be fixed for restored tabs to retain their bar and inherit cwd. Live detection must include the cache/socket version because old/new servers can share a session name. Bash's outer-shell executable cache may require `hash -r` after installation; inspect the actual client executable, not just PATH.
 
 Hard rules enforced by the installer (preserve these if editing):
 - It **aborts** if an active `post_command_discovery_hook` pointing elsewhere already exists — never silently overwrite a user's hook.

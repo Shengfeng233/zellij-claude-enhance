@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Use the upgraded Zellij outside sessions. Keep commands inside a live legacy
+# session talking to that session's server until the user moves to a new one.
+set -euo pipefail
+
+# A server outlives the command creating it: do not let Codex tool logging
+# defaults permanently disable color in its future interactive panes.
+if [[ "${CODEX_CI:-}" == 1 ]]; then
+    if [[ "${NO_COLOR:-}" == 1 ]]; then unset NO_COLOR; fi
+    if [[ -n "${COLORTERM+x}" && -z "$COLORTERM" ]]; then unset COLORTERM; fi
+fi
+
+root="$HOME/.local/share/zellij-improve"
+if [[ -n "${ZELLIJ+x}" ]]; then
+    # Prefer the actual ancestor server, including when old/new versions have
+    # sessions with the same name. New Zellij uses contract-version socket dirs.
+    probe="$PPID"
+    for ((depth = 0; depth < 64 && probe > 1; depth++)); do
+        [[ -r "/proc/$probe/cmdline" && -r "/proc/$probe/status" ]] || break
+        mapfile -d '' -t argv < "/proc/$probe/cmdline" || break
+        executable="${argv[0]:-}"
+        if [[ "${executable##*/}" == zellij && "${argv[1]:-}" == --server ]]; then
+            server_binary="$(readlink "/proc/$probe/exe" || true)"
+            if [[ -x "$server_binary" ]]; then
+                exec "$server_binary" "$@"
+            fi
+            break
+        fi
+        parent=0
+        while read -r key value _; do
+            if [[ "$key" == PPid: ]]; then parent="$value"; break; fi
+        done < "/proc/$probe/status"
+        probe="$parent"
+    done
+fi
+if [[ -n "${ZELLIJ+x}" && -n "${ZELLIJ_SESSION_NAME:-}" && -x "$root/previous/zellij" ]]; then
+    previous_version="$(basename "$(readlink -f "$root/previous")")"
+    for socket_root in "${ZELLIJ_SOCKET_DIR:-}" "${XDG_RUNTIME_DIR:-/tmp}/zellij"; do
+        [[ -n "$socket_root" ]] || continue
+        if [[ -S "$socket_root/$previous_version/$ZELLIJ_SESSION_NAME" ]]; then
+            exec "$root/previous/zellij" "$@"
+        fi
+    done
+fi
+# Repair serialized stock tab templates before a new server reads them.
+# The fixer skips live servers and leaves custom layouts intact.
+fixer="$HOME/.local/bin/zellij-fix-statusbar.sh"
+if [[ -x "$fixer" && -f "$HOME/.local/bin/zellij-layout-repair.py" ]]; then
+    "$fixer" >/dev/null
+fi
+exec "$root/current/zellij" "$@"

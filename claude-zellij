@@ -18,6 +18,9 @@
 
 set -euo pipefail
 
+COLOR_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/zellij-color-env.sh"
+if [[ -f "$COLOR_ENV" ]]; then source "$COLOR_ENV"; fi
+
 MARKER_DIR="$HOME/.local/share/claude-zellij/markers"
 HELPER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-zellij-pty.py"
 

@@ -234,7 +234,17 @@ case "$cmd" in
 
             for subcmd in $codex_subcommands; do
                 if [[ "$first_non_flag" == "$subcmd" ]]; then
-                    echo "$cmd"
+                    if [[ "$subcmd" == resume || "$subcmd" == fork ]]; then
+                        # Keep the explicit session/picker and all arguments,
+                        # but use the same scrollback renderer as the wrapper.
+                        inline_args=()
+                        if [[ " ${words[*]} " != *" --no-alt-screen "* ]]; then
+                            inline_args+=(--no-alt-screen)
+                        fi
+                        print_cmd "${words[0]}" "${inline_args[@]}" "${words[@]:1}"
+                    else
+                        echo "$cmd"
+                    fi
                     exit 0
                 fi
             done

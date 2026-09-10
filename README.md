@@ -75,7 +75,7 @@ On claude versions without the sessions registry, the watcher falls back to a `~
 
 ### Codex: session ID capture
 
-Codex doesn't support `--session-id`, so `codex-zellij` captures the session ID from `~/.codex/session_index.jsonl` after Codex starts. The wrapper also forces `--no-alt-screen` for all interactive sessions, which works better with Zellij's pane model.
+Codex doesn't support `--session-id`, so `codex-zellij` captures the session ID from `~/.codex/session_index.jsonl` after Codex starts. The wrapper enables `--no-alt-screen` for interactive sessions and keeps Codex's normal rich rendering. Zellij must be at least 0.44.1 to retain this history; the tested release is 0.45.1.
 
 ### Claude: Ctrl+Y hot reboot
 
@@ -146,15 +146,20 @@ zellij attach <session-name>
    - `codex-zellij` is only installed if `codex` is found on PATH
 2. Normalizes serialized layouts of dead sessions (`zellij-fix-statusbar.sh`) so their status bars survive resurrection
 3. Backs up `~/.config/zellij/config.kdl`
-4. Patches three Zellij config settings:
+4. Patches these Zellij config settings:
 
 | Setting | Value | Purpose |
 |---|---|---|
 | `on_force_close` | `"detach"` | Detach instead of quit on crash |
 | `session_serialization` | `true` | Serialize pane commands to disk |
 | `post_command_discovery_hook` | path to hook script | Transform commands on resurrection |
+| `mouse_mode` | `true` | Let the wheel scroll individual panes |
+| `pane_frames` | `true` | Show pane frames |
+| `pane_frame_style` | `"full"` | Keep full pane boundaries, spacing, and scroll-position display |
 
-5. With `--with-layout`: installs `statusbar-fixed.kdl` and sets `default_layout "statusbar-fixed"` so every new session keeps the status bar pinned
+5. Removes the obsolete managed scroll-shortcut block from earlier installations. The scrolling fix is in the upgraded Zellij terminal parser.
+6. With `--with-layout`: installs `statusbar-fixed.kdl` and sets `default_layout "statusbar-fixed"` so every new session keeps the status bar pinned
+7. Installs `zellij-color-env.sh` and sources it from the wrappers and existing Bash/Zsh rc files (backed up first). It repairs automation-inherited color settings only in interactive Zellij panes.
 
 The installer **will not** silently overwrite an existing `post_command_discovery_hook`. If a conflict is detected, it aborts with a clear error.
 
@@ -213,7 +218,7 @@ codex-zellij
 codex-zellij --full-auto
 codex-zellij --model o3 "refactor this"
 
-# Interactive subcommands get --no-alt-screen injected:
+# Interactive subcommands get inline mode with normal rich rendering:
 codex-zellij resume --last
 codex-zellij fork --last
 
@@ -344,7 +349,11 @@ zellij attach test-recovery
 | `codex-zellij` | `~/.local/bin/codex-zellij` | Codex wrapper with marker UUID + session capture + inline mode |
 | `zellij-resurrect-hook.sh` | `~/.local/bin/zellij-resurrect-hook.sh` | Zellij resurrection hook for Claude/Codex commands |
 | `zellij-fix-statusbar.sh` | `~/.local/bin/zellij-fix-statusbar.sh` | Heals serialized session layouts so status bars survive resurrection |
+| `zellij-layout-repair.py` | `~/.local/bin/zellij-layout-repair.py` | Repairs stock new-tab templates and serialized common-root cwd, with backups |
 | `statusbar-fixed.kdl` | `~/.config/zellij/layouts/statusbar-fixed.kdl` | Layout with pinned status bar (resurrection-safe plugin URLs) |
+| `upgrade-zellij.sh` | *(run from repo)* | Verified Zellij release installer; retains old servers |
+| `zellij-dispatch` | `~/.local/bin/zellij` | Routes CLI commands to the active server version |
+| `zellij-color-env.sh` | `~/.local/bin/zellij-color-env.sh` | Repairs automation-inherited color suppression in interactive panes |
 | `install.sh` | *(run from repo)* | Installer and config patcher |
 
 ## Uninstalling
@@ -394,9 +403,124 @@ Run `zellij-fix-statusbar.sh` (heals dead sessions' serialized layouts), and ins
 
 If Zellij serializes the child process (`codex`) instead of the wrapper (`codex-zellij`), recovery falls back to `codex resume --last` which picks the most recent session per CWD. Multiple panes in the same directory may get the same session. Run the crash test to check which behavior you get.
 
-### Codex history not scrollable
+### Codex history not scrollable, or history shows too much code
 
-`codex-zellij` forces `--no-alt-screen`, but Codex still renders its own TUI viewport. Use `Ctrl+T` inside Codex to browse the full transcript. This is an upstream Codex limitation.
+Use **Zellij 0.44.1 or newer** with Codex's normal rendering. Zellij 0.43.1 drops
+history scrolled out of partial DEC scroll regions. The [upstream fix shipped in
+0.44.1](https://github.com/zellij-org/zellij/releases/tag/v0.44.1). The verified
+combination here is Zellij **0.45.1** and Codex **0.153.4**: rich formatting,
+folded tool output, and normal wheel/trackpad scrolling all work.
+
+```bash
+./upgrade-zellij.sh   # installs pinned, SHA-256 verified Zellij 0.45.1
+./install.sh          # installs recovery wrappers without forcing raw output
+```
+
+The release installer supports Linux x86_64. It retains the previous binary and
+installs a small dispatcher at `~/.local/bin/zellij`: outside sessions it runs
+the new version; inside an old session it keeps CLI actions talking to the
+actual ancestor server. Existing sessions continue running. Ensure
+`~/.local/bin` precedes your old Zellij location on PATH; run `hash -r` in
+existing Bash shells after installation.
+
+**An existing Zellij server must be recreated to receive the fix.** Detaching
+and reattaching to the same old server does not upgrade it. Start the new
+version from a fresh terminal and create a new session, then resume Codex:
+
+```bash
+~/.local/bin/zellij -s rich-history
+codex-zellij resume
+```
+
+If migrating a layout, export it with the old session's `zellij action
+dump-layout`, then start the new version with that layout under a different
+session name. Keep restored commands suspended until you are ready to resume
+them. Versioned Zellij releases have separate session discovery/cache namespaces;
+copying a layout does not transfer running processes. Retain the original
+session while checking the new one.
+
+If an earlier workaround enabled raw mode, change the existing setting in
+`~/.codex/config.toml` to `raw_output_mode = false` under `[tui]`. Raw mode expands
+tool/code output and is **not** the desired default. Remove any explicit
+`-c tui.raw_output_mode=true` launch arguments too. The installer does not edit
+Codex's global config. In a running Codex instance on the new Zellij server,
+Alt+R or `/raw` toggles back to rich output.
+
+Scroll normally with the **mouse wheel or trackpad** over the pane. The
+installer enables Zellij's `mouse_mode`. Extra Alt+PageUp/PageDown bindings are
+not needed; the obsolete managed bindings are removed on reinstall. Ctrl+T
+remains Zellij's tab-mode shortcut unless Zellij is locked.
+
+Validation must use actual multi-screen conversation history, including folded
+tool output. Shell output printed before Codex starts cannot catch this bug.
+With Zellij 0.45.1, `zellij action dump-screen --full` prints the history (use
+`--path FILE` to save it). In 0.43.1 the output path is a positional argument.
+The tested rich conversation retained over 1,200 lines and wheel scrolling
+reached older text without enabling raw mode.
+
+### Plain `zellij` starts the old version; restored tabs lose the bar or open in `/`
+
+Bash may still have `/usr/local/bin/zellij` cached after installing the newer
+launcher in `~/.local/bin`. Clear the cache **in the outer shell, outside
+Zellij**, then check the version:
+
+```bash
+hash -r
+zellij --version        # expected: 0.45.1
+```
+
+Inside an old running session the dispatcher deliberately reports/uses that
+server's old version for compatibility; installing a binary does not update
+its server. Attach to a session created by the new version to get rich Codex
+scrollback. New normal launches use the `statusbar-fixed` layout.
+
+A separate serialization defect can leave the saved `new_tab_template` as
+only `pane cwd="/"`, even while the existing tabs have normal UI bars. New
+tabs then look like standalone screens and start in `/`. A serialized top-level
+`cwd "/"` also overrides inheritance, even after removing the pane's cwd.
+
+The layout repair restores both UI bars for this known broken stock template,
+makes explicit saved pane paths absolute, and removes the serialized common
+root so new tabs inherit the active directory. It preserves custom templates
+and writes backups before changes. The launcher runs the repair before a new
+server reads saved state; live servers are skipped by **version and session
+name**. This also handles the old and upgraded servers sharing a session name.
+An already-loaded broken template takes effect only after recreating that
+server from the repaired state.
+
+Validated through the actual keyboard sequence **Ctrl+T, N**, both from a fresh
+session and from a repaired serialized layout: the second tab appears in the
+same tab bar and inherits a changed working directory, including paths with
+spaces. The normal launch test also verifies Codex's compact output, ANSI
+colors, and wheel scrolling together.
+
+### Both Codex and Claude lose their colors
+
+A Zellij server created from a Codex tool call can inherit `CODEX_CI=1`,
+`NO_COLOR=1`, and an empty `COLORTERM`. The server then passes those logging
+defaults to its panes, even when a normal terminal client attaches later.
+This is an environment problem, not a reason to replace themes or force a
+different palette.
+
+The dispatcher strips the known automation color defaults before launching
+Zellij. The wrappers and shell startup hook also repair interactive launches
+in an already-contaminated server. A normal user's `NO_COLOR` preference,
+noninteractive output, and non-Zellij terminals are preserved. Use the
+dispatcher when creating servers from automation; calling the versioned native
+binary directly bypasses this protection.
+
+Existing applications cache color support at startup and need a normal
+restart/resume after the launch environment is repaired. Do not interrupt an
+active agent without checking with its user. Existing idle shells can load the
+repair with `source ~/.local/bin/zellij-color-env.sh`; new shells load it
+automatically. The Claude wrapper's Ctrl+Y reboot re-reads the repaired launcher.
+
+Run the environment regressions with
+`python3 -m unittest discover -s tests -v`. Color verification must also inspect
+actual foreground ANSI color codes from both applications, not just bold/dim
+formatting or Zellij's status bar. Separate TUI checks with the contaminated
+environment produced 20 Codex color styles and 3 Claude color styles after
+repair, without changing their themes.
 
 ### Multiple Claude panes resume the same conversation
 

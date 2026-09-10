@@ -88,6 +88,12 @@ mkdir -p "$CONFIG_DIR"
 mkdir -p "$LAYOUT_DIR"
 
 # --- Install scripts ---
+echo "Installing zellij-color-env.sh -> $BIN_DIR/zellij-color-env.sh"
+cp "$SCRIPT_DIR/zellij-color-env.sh" "$BIN_DIR/zellij-color-env.sh"
+
+echo "Installing zellij-layout-repair.py -> $BIN_DIR/zellij-layout-repair.py"
+cp "$SCRIPT_DIR/zellij-layout-repair.py" "$BIN_DIR/zellij-layout-repair.py"
+
 echo "Installing claude-zellij -> $BIN_DIR/claude-zellij"
 cp "$SCRIPT_DIR/claude-zellij" "$BIN_DIR/claude-zellij"
 chmod +x "$BIN_DIR/claude-zellij"
@@ -155,6 +161,43 @@ echo "Patched: on_force_close \"detach\""
 patch_setting "session_serialization" "true" "$CONFIG_FILE"
 echo "Patched: session_serialization true"
 
+# Mouse events must reach Zellij to scroll individual panes.
+patch_setting "mouse_mode" "true" "$CONFIG_FILE"
+echo "Patched: mouse_mode true"
+
+# Zellij 0.45 defaults to titles-only. Keep the full borders and the frame's
+# scroll-position display used by this setup.
+patch_setting "pane_frames" "true" "$CONFIG_FILE"
+patch_setting "pane_frame_style" '"full"' "$CONFIG_FILE"
+echo "Patched: full pane frames"
+
+# Remove the obsolete shortcut workaround from earlier installations. It cannot
+# recover history discarded by partial scroll regions; upgrading Zellij can.
+scroll_tmp="${CONFIG_FILE}.scroll.$$"
+awk '
+    $0 == "// BEGIN zellij-improve scroll navigation" { managed = 1; next }
+    $0 == "// END zellij-improve scroll navigation" { managed = 0; next }
+    managed == 0 { print }
+' "$CONFIG_FILE" > "$scroll_tmp"
+mv "$scroll_tmp" "$CONFIG_FILE"
+
+# New interactive shells in an already-contaminated server also need the
+# repair before launching bare codex/claude. Do not rewrite existing rc files.
+for shell_rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f "$shell_rc" ]] || continue
+    if ! grep -qF '# zellij-improve: repair inherited automation color settings' "$shell_rc"; then
+        cp "$shell_rc" "${shell_rc}.backup.zellij-colors.$(date +%Y%m%d_%H%M%S)"
+        cat >> "$shell_rc" <<'SHELL_COLOR_ENV'
+
+# zellij-improve: repair inherited automation color settings
+if [[ -n "${ZELLIJ:-}" && -f "$HOME/.local/bin/zellij-color-env.sh" ]]; then
+    . "$HOME/.local/bin/zellij-color-env.sh"
+fi
+SHELL_COLOR_ENV
+        echo "Installed color environment repair in $shell_rc (backup saved)."
+    fi
+done
+
 # --- Optional layout ---
 if $WITH_LAYOUT; then
     echo "Installing statusbar-fixed.kdl -> $LAYOUT_DIR/statusbar-fixed.kdl"
@@ -194,7 +237,7 @@ fi
 
 # Verify patched settings
 echo "Checking patched config settings..."
-for setting in on_force_close session_serialization post_command_discovery_hook; do
+for setting in on_force_close session_serialization post_command_discovery_hook mouse_mode pane_frames pane_frame_style; do
     if grep -qE "^[[:space:]]*${setting}[[:space:]]" "$CONFIG_FILE" 2>/dev/null; then
         line=$(grep -E "^[[:space:]]*${setting}[[:space:]]" "$CONFIG_FILE" | head -1)
         echo "  $line"
@@ -225,4 +268,6 @@ echo ""
 echo "=== Installation complete ==="
 echo "Use 'claude-zellij' instead of 'claude' for guaranteed session recovery."
 echo "Inside a claude-zellij pane, press Ctrl+Y to reboot Claude into the same conversation."
-echo "Use 'codex-zellij' instead of 'codex' for best-effort session recovery with inline mode enabled."
+echo "Use 'codex-zellij' instead of 'codex' for session recovery and inline mode."
+echo "Normal Codex formatting with mouse scrolling requires Zellij >= 0.44.1 (tested: 0.45.1)."
+echo "Use ./upgrade-zellij.sh to install the tested release; existing servers must be recreated."

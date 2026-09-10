@@ -19,23 +19,23 @@ shopt -s nullglob
 
 fixed=0
 skipped_live=0
+repair_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/zellij-layout-repair.py"
 
 for layout_file in "$HOME"/.cache/zellij/*/session_info/*/session-layout.kdl; do
     session_name="$(basename "$(dirname "$layout_file")")"
+    cache_version="$(basename "$(dirname "$(dirname "$(dirname "$layout_file")")")")"
 
     # Skip sessions whose server is alive ([r] avoids matching ourselves)
-    if pgrep -f "zellij --serve[r] .*/${session_name}\$" > /dev/null 2>&1; then
+    # Old/new Zellij versions can have independent sessions with the same name.
+    server_suffix="$(python3 -c 'import re, sys; print(re.escape(sys.argv[1]))' "/$cache_version/$session_name")"
+    if pgrep -f "zellij --serve[r] .*${server_suffix}\$" > /dev/null 2>&1; then
         skipped_live=$((skipped_live + 1))
         continue
     fi
 
-    if grep -qE 'location="(tab-bar|status-bar|compact-bar)"' "$layout_file"; then
-        sed -i \
-            -e 's/location="tab-bar"/location="zellij:tab-bar"/g' \
-            -e 's/location="status-bar"/location="zellij:status-bar"/g' \
-            -e 's/location="compact-bar"/location="zellij:compact-bar"/g' \
-            "$layout_file"
-        echo "fixed: $session_name"
+    result="$(python3 "$repair_script" "$layout_file")"
+    if [[ -n "$result" ]]; then
+        echo "$result"
         fixed=$((fixed + 1))
     fi
 done
