@@ -4,12 +4,13 @@
 # Called by Zellij via post_command_discovery_hook with RESURRECT_COMMAND env var.
 
 cmd="$RESURRECT_COMMAND"
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Opportunistically heal serialized layouts of other dead sessions so their
 # status bars survive resurrection (see zellij-fix-statusbar.sh). Idempotent,
 # skips running sessions, and runs in the background so the hook stays fast.
 # Everything is silenced: stdout of this hook IS the resurrected command.
-fixer="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/zellij-fix-statusbar.sh"
+fixer="$hook_dir/zellij-fix-statusbar.sh"
 if [[ -x "$fixer" ]]; then
     ("$fixer" >/dev/null 2>&1 &)
 fi
@@ -27,6 +28,21 @@ print_cmd() {
     done
     printf '\n'
 }
+
+# --- ssh ---
+# ssh-zellij (installed next to this hook) keeps an ssh pane usable when the
+# link dies: Ctrl+Y reconnects in place and a lost connection reconnects
+# automatically. Resurrect bare ssh panes through it; the rest of the command
+# line is kept verbatim. This rule comes first so a remote command that
+# mentions claude or codex is never rewritten as a local one.
+case "$cmd" in
+    ssh\ *)
+        if [[ -x "$hook_dir/ssh-zellij" ]]; then
+            printf '%q %s\n' "$hook_dir/ssh-zellij" "${cmd#ssh }"
+            exit 0
+        fi
+        ;;
+esac
 
 # Claude stores sessions as ~/.claude/projects/<cwd-slug>/<session-id>.jsonl.
 # A stored ID can stop resolving: Claude's cleanup deletes sessions after

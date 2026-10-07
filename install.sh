@@ -110,6 +110,16 @@ else
     echo "Skipping codex-zellij (codex not found on PATH)"
 fi
 
+# The resurrection hook upgrades bare ssh panes to ssh-zellij when it is
+# installed next to the hook.
+if command -v ssh &>/dev/null; then
+    echo "Installing ssh-zellij -> $BIN_DIR/ssh-zellij"
+    cp "$SCRIPT_DIR/ssh-zellij" "$BIN_DIR/ssh-zellij"
+    chmod +x "$BIN_DIR/ssh-zellij"
+else
+    echo "Skipping ssh-zellij (ssh not found on PATH)"
+fi
+
 echo "Installing zellij-resurrect-hook.sh -> $HOOK_PATH"
 cp "$SCRIPT_DIR/zellij-resurrect-hook.sh" "$HOOK_PATH"
 chmod +x "$HOOK_PATH"
@@ -222,6 +232,11 @@ fi
 if [[ -f "$BIN_DIR/codex-zellij" ]] && ! bash -n "$BIN_DIR/codex-zellij"; then
     syntax_ok=false
 fi
+# compile() instead of py_compile: the script has no .py suffix, and
+# py_compile would leave an oddly named .pyc in ~/.local/bin/__pycache__.
+if [[ -f "$BIN_DIR/ssh-zellij" ]] && ! python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$BIN_DIR/ssh-zellij"; then
+    syntax_ok=false
+fi
 if ! bash -n "$HOOK_PATH"; then
     syntax_ok=false
 fi
@@ -269,5 +284,9 @@ echo "=== Installation complete ==="
 echo "Use 'claude-zellij' instead of 'claude' for guaranteed session recovery."
 echo "Inside a claude-zellij pane, press Ctrl+Y to reboot Claude into the same conversation."
 echo "Use 'codex-zellij' instead of 'codex' for session recovery and inline mode."
+if [[ -f "$BIN_DIR/ssh-zellij" ]]; then
+    echo "Use 'ssh-zellij <host>' instead of 'ssh <host>': Ctrl+Y reconnects a dead or hung pane,"
+    echo "and lost connections reconnect automatically."
+fi
 echo "Normal Codex formatting with mouse scrolling requires Zellij >= 0.44.1 (tested: 0.45.1)."
 echo "Use ./upgrade-zellij.sh to install the tested release; existing servers must be recreated."

@@ -1,6 +1,6 @@
 # zellij-claude-enhance
 
-Automatic session recovery for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex) running inside [Zellij](https://zellij.dev/).
+Automatic session recovery for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex) running inside [Zellij](https://zellij.dev/), plus one-key reconnect for SSH panes.
 
 ## The Problem
 
@@ -8,9 +8,11 @@ If you run multiple Claude Code or Codex instances across Zellij tabs and panes,
 
 With 8+ AI panes open, reconnecting each one manually is painful.
 
+SSH panes have a related problem. When the network path drops, for example when a laptop sleeps or a VPN reconnects, ssh does not notice. The pane stops responding until you kill ssh with `Enter ~ .` and reconnect by hand, pane by pane.
+
 ## The Solution
 
-Two thin wrapper scripts — `claude-zellij` and `codex-zellij` — plus a Zellij resurrection hook that together give you **per-pane session recovery** and **in-place hot reboot**:
+Thin wrapper scripts — `claude-zellij`, `codex-zellij` and `ssh-zellij` — plus a Zellij resurrection hook that together give you **per-pane session recovery**, **in-place hot reboot** and **one-key SSH reconnect**:
 
 | Tool | Wrapper | Recovery |
 |---|---|---|
@@ -18,12 +20,15 @@ Two thin wrapper scripts — `claude-zellij` and `codex-zellij` — plus a Zelli
 | Codex CLI | `codex-zellij` | Per-pane session capture + inline mode (`--no-alt-screen`) |
 | Bare `claude` | (none needed) | Best-effort fallback via `claude --continue` |
 | Bare `codex` | (none needed) | Best-effort fallback via `codex resume --last` |
+| SSH | `ssh-zellij` | Ctrl+Y reconnect + automatic reconnect; bare `ssh` panes are resurrected through it |
 
 If a stored session ID no longer resolves — Claude Code deletes sessions after ~30 days, and a session that never received a message is never written to disk — recovery degrades gracefully (`claude --continue` for bare claude, a fresh tracked session for `claude-zellij`) instead of dying with `No conversation found with session ID`.
 
 After a crash, just reattach (`zellij attach <session>`) and every AI pane picks up exactly where it left off.
 
 `claude-zellij` also supports **Ctrl+Y hot reboot** — restart Claude in-place without losing your conversation. This is useful when you change Claude's settings, CLAUDE.md instructions, or MCP server configuration and need Claude to pick them up without starting a new session.
+
+`ssh-zellij` uses the same key for SSH panes: **Ctrl+Y** drops a dead or hung connection and reconnects in the same pane, and lost connections are detected and reconnected automatically. See [SSH](#ssh).
 
 ## Demo
 
@@ -47,7 +52,7 @@ All four conversations are back exactly where they left off — each pane resume
 
 ## How It Works
 
-Both wrappers follow the same architecture:
+Both AI wrappers follow the same architecture:
 
 ```
 1. Generate a marker UUID
@@ -99,11 +104,27 @@ This happens in-place — no new pane, no tab switching, no manual `--resume` fl
 
 Because the wrapper `exec`s into the PTY proxy, the proxy is the process Zellij discovers and serializes. The resurrection hook recognizes the serialized proxy command line (`... claude-zellij-pty.py --wrapper <path> --marker <uuid> -- claude ...`) and rewrites it back to `claude-zellij --zellij-marker <uuid>`, so recovery always goes through the wrapper's marker logic instead of replaying a stale `claude --session-id` command.
 
+### SSH: Ctrl+Y reconnect proxy
+
+A plain `ssh` pane freezes when its network path dies: a laptop sleeps, Wi-Fi or a VPN changes, or a mesh VPN such as Tailscale briefly drops the local address. Without `ServerAliveInterval`, ssh cannot tell the link is gone. It waits for the kernel instead, which gives up only after about 15 minutes of retransmitting your keystrokes, or after 2 hours of TCP keepalive when idle. Meanwhile the terminal is in raw mode, so every key, Ctrl+C included, goes into the dead connection. Zellij itself is fine, but it has no action that restarts a pane's process, so the fix has to run inside the pane.
+
+`ssh-zellij` puts a PTY proxy in front of ssh, the same idea as the Claude hot reboot:
+
+```
+Zellij pane ↔ ssh-zellij (PTY proxy) ↔ ssh child process
+```
+
+1. Before starting ssh, it reads the effective configuration with `ssh -G`. It adds `ServerAliveInterval=10` and `ConnectTimeout=10` only when your configuration leaves them unset, so a dead link ends ssh in about 40 seconds.
+2. ssh runs on a private PTY that gets the pane's terminal modes and size, so the remote side sees the same terminal as with plain ssh. Pane resizes are forwarded.
+3. **Ctrl+Y** terminates ssh's process group, escalating to SIGKILL after half a second, resets the terminal, and starts ssh again.
+4. When ssh exits by itself, the proxy reads its exit status and last lines of output. A normal logout ends the proxy too. Exit status 255 after an authentication, host key or configuration error, or after the `~.` escape, waits for a key. Any other exit status 255 is a lost connection and reconnects with backoff.
+
 ## Prerequisites
 
 - [Zellij](https://zellij.dev/) 0.43+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`) and/or [Codex CLI](https://github.com/openai/codex) (`codex`)
-- Python 3 (for the Ctrl+Y hot reboot PTY proxy)
+- Python 3 (for the Ctrl+Y PTY proxies)
+- OpenSSH client (`ssh`), only for `ssh-zellij`
 - `uuidgen` (pre-installed on most Linux distributions)
 - Bash 4+
 
@@ -114,9 +135,10 @@ git clone https://github.com/Shengfeng233/zellij-claude-enhance.git
 cd zellij-claude-enhance
 ./install.sh
 
-# Now use these instead of bare claude/codex:
+# Now use these instead of bare claude/codex/ssh:
 claude-zellij
 codex-zellij
+ssh-zellij user@server.example.com
 ```
 
 If Zellij crashes or WSL shuts down, just reattach:
@@ -142,8 +164,9 @@ zellij attach <session-name>
 
 ### What the installer does
 
-1. Copies `claude-zellij`, `claude-zellij-pty.py`, `codex-zellij`, `zellij-resurrect-hook.sh`, and `zellij-fix-statusbar.sh` to `~/.local/bin/`
+1. Copies `claude-zellij`, `claude-zellij-pty.py`, `codex-zellij`, `ssh-zellij`, `zellij-resurrect-hook.sh`, and `zellij-fix-statusbar.sh` to `~/.local/bin/`
    - `codex-zellij` is only installed if `codex` is found on PATH
+   - `ssh-zellij` is only installed if `ssh` is found on PATH
 2. Normalizes serialized layouts of dead sessions (`zellij-fix-statusbar.sh`) so their status bars survive resurrection
 3. Backs up `~/.config/zellij/config.kdl`
 4. Patches these Zellij config settings:
@@ -238,6 +261,31 @@ codex-zellij --full-auto
   → crash → reattach → wrapper reads marker → codex resume <session-id> --no-alt-screen
 ```
 
+### SSH
+
+Use `ssh-zellij` exactly like `ssh`:
+
+```bash
+ssh-zellij user@server.example.com
+ssh-zellij -t server.example.com tmux new -A -s main   # remote tmux keeps your shell across reconnects
+ssh-zellij -N -L 8888:localhost:8888 server.example.com   # tunnels reconnect too
+```
+
+- **Ctrl+Y** drops the current connection, even a hung one, and reconnects in the same pane within about a second.
+- **A lost connection reconnects by itself** about 40 seconds after the link goes silent. Retries back off from 1 s to 30 s. During the countdown, `Ctrl+Y` or `Enter` reconnects at once and `q` or `Ctrl+C` returns to the shell.
+- **Some exits wait for you instead.** Retrying automatically after an authentication, host key or configuration error could trigger fail2ban. After the `~.` escape, or in a session started with a remote command, a retry would re-run something you may not want. Press `Ctrl+Y` or `Enter` to retry.
+- **The terminal is reset before reconnecting.** Modes a dead remote program left on are turned off: alternate screen, mouse reporting, hidden cursor, bracketed paste, and the kitty keyboard protocol. Otherwise the mouse wheel would type escape codes into the new shell.
+- **A normal logout exits with ssh's status**, like plain ssh. Without a terminal, for example in scripts or pipes, ssh-zellij simply runs ssh.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SSH_ZELLIJ_KEY` | `^Y` | Reconnect key: any `^A`..`^Z`, `^]`, `^\`, or `none`. Ctrl+Y no longer reaches remote programs, which matters for bash and Emacs yank or nano's page up |
+| `SSH_ZELLIJ_AUTO` | interactive only | `1` also reconnects sessions with a remote command, `0` never reconnects without a key press |
+
+A reconnect starts a new remote login. Programs running in the old shell's foreground end when the server notices the old connection is gone. Run long jobs under `tmux`, `nohup`, or a job runner on the remote side.
+
+Zellij serializes a pane running `ssh-zellij` like any other command. The resurrection hook also rewrites bare `ssh ...` panes to `ssh-zellij ...`, so ssh panes typed with plain `ssh` come back with reconnect support after a crash.
+
 ### Bare CLI fallback
 
 Commands run without the wrapper still get best-effort recovery:
@@ -249,7 +297,7 @@ This works for single-pane setups. For multiple AI panes in the same directory, 
 
 ### What is NOT recovered
 
-Non-AI commands pass through the hook unchanged:
+Non-AI commands other than `ssh` pass through the hook unchanged:
 
 ```bash
 npm exec @upstash/context7-mcp   # unchanged
@@ -290,7 +338,16 @@ bash -n ~/.local/bin/claude-zellij
 python3 -m py_compile ~/.local/bin/claude-zellij-pty.py
 bash -n ~/.local/bin/codex-zellij
 bash -n ~/.local/bin/zellij-resurrect-hook.sh
+python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' ~/.local/bin/ssh-zellij
 ```
+
+### Regression tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The ssh-zellij tests drive the proxy on a pseudo-terminal with a fake `ssh` on PATH, so they need no network or sshd.
 
 ### Hook tests
 
@@ -315,6 +372,10 @@ RESURRECT_COMMAND="codex" ~/.local/bin/zellij-resurrect-hook.sh
 
 RESURRECT_COMMAND="codex exec do something" ~/.local/bin/zellij-resurrect-hook.sh
 # → codex exec do something  (unchanged)
+
+# SSH
+RESURRECT_COMMAND="ssh user@server.example.com" ~/.local/bin/zellij-resurrect-hook.sh
+# → /home/<you>/.local/bin/ssh-zellij user@server.example.com
 
 # Other
 RESURRECT_COMMAND="npm exec @upstash/context7-mcp" ~/.local/bin/zellij-resurrect-hook.sh
@@ -347,7 +408,8 @@ zellij attach test-recovery
 | `claude-zellij` | `~/.local/bin/claude-zellij` | Claude wrapper with marker UUID + `/resume` tracking |
 | `claude-zellij-pty.py` | `~/.local/bin/claude-zellij-pty.py` | PTY proxy for Claude hot reboot that keeps terminal resize in sync |
 | `codex-zellij` | `~/.local/bin/codex-zellij` | Codex wrapper with marker UUID + session capture + inline mode |
-| `zellij-resurrect-hook.sh` | `~/.local/bin/zellij-resurrect-hook.sh` | Zellij resurrection hook for Claude/Codex commands |
+| `ssh-zellij` | `~/.local/bin/ssh-zellij` | ssh PTY proxy with Ctrl+Y reconnect, dead-link detection and automatic reconnect |
+| `zellij-resurrect-hook.sh` | `~/.local/bin/zellij-resurrect-hook.sh` | Zellij resurrection hook for Claude/Codex/ssh commands |
 | `zellij-fix-statusbar.sh` | `~/.local/bin/zellij-fix-statusbar.sh` | Heals serialized session layouts so status bars survive resurrection |
 | `zellij-layout-repair.py` | `~/.local/bin/zellij-layout-repair.py` | Repairs stock new-tab templates and serialized common-root cwd, with backups |
 | `statusbar-fixed.kdl` | `~/.config/zellij/layouts/statusbar-fixed.kdl` | Layout with pinned status bar (resurrection-safe plugin URLs) |
@@ -359,7 +421,7 @@ zellij attach test-recovery
 ## Uninstalling
 
 ```bash
-rm ~/.local/bin/claude-zellij ~/.local/bin/claude-zellij-pty.py ~/.local/bin/codex-zellij ~/.local/bin/zellij-resurrect-hook.sh ~/.local/bin/zellij-fix-statusbar.sh
+rm ~/.local/bin/claude-zellij ~/.local/bin/claude-zellij-pty.py ~/.local/bin/codex-zellij ~/.local/bin/ssh-zellij ~/.local/bin/zellij-resurrect-hook.sh ~/.local/bin/zellij-fix-statusbar.sh
 rm -rf ~/.local/share/claude-zellij ~/.local/share/codex-zellij
 rm ~/.config/zellij/layouts/statusbar-fixed.kdl  # if installed
 
@@ -398,6 +460,16 @@ Run `zellij-fix-statusbar.sh` (heals dead sessions' serialized layouts), and ins
 2. Check that `~/.local/bin/claude-zellij-pty.py` exists
 3. Run `python3 -m py_compile ~/.local/bin/claude-zellij-pty.py`
 4. Press `Ctrl+Y` while the Claude pane is focused in Zellij normal mode
+
+### An SSH pane stops responding
+
+The connection died and ssh has not noticed yet. In a plain `ssh` pane, type `Enter ~ .` to kill ssh, then run it again. Use `ssh-zellij` instead to make this a single `Ctrl+Y`, and to have dead links detected and reconnected automatically. If `Ctrl+Y` does nothing:
+
+1. Check that the pane runs `ssh-zellij`. The first line it prints is `[ssh-zellij] Ctrl+Y reconnects this pane`.
+2. Check that `SSH_ZELLIJ_KEY` is not set to another key or `none`.
+3. Check that Zellij is in normal mode. A Zellij binding for `Ctrl y` would take the key before the pane sees it.
+
+If panes on a Tailscale network freeze together, look at `journalctl -u tailscaled` around that time for `LinkChange` lines in which `tailscale0` loses its 100.x address. Each such event breaks every connection that uses the address.
 
 ### Codex resumes wrong session
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Per-pane session recovery for Claude Code and Codex CLI running inside Zellij, plus fixes for scrollback, inherited color settings, and status-bar displacement. The deliverable is small recovery and installation scripts plus a layout. There is no build system or package manager. Changes are validated by syntax checks, Python standard-library regression tests, and manual terminal/crash-recovery testing.
+Per-pane session recovery for Claude Code and Codex CLI running inside Zellij, Ctrl+Y reconnect for ssh panes, plus fixes for scrollback, inherited color settings, and status-bar displacement. The deliverable is small recovery and installation scripts plus a layout. There is no build system or package manager. Changes are validated by syntax checks, Python standard-library regression tests, and manual terminal/crash-recovery testing.
 
 ## Common commands
 
@@ -13,7 +13,7 @@ Per-pane session recovery for Claude Code and Codex CLI running inside Zellij, p
 ./install.sh
 ./install.sh --with-layout   # also installs statusbar-fixed.kdl
 
-# Color environment regressions:
+# Regression tests (color environment, layout repair, ssh-zellij PTY proxy + hook rule):
 python3 -m unittest discover -s tests -v
 
 # Syntax checks:
@@ -22,6 +22,7 @@ bash -n codex-zellij
 bash -n zellij-resurrect-hook.sh
 bash -n zellij-fix-statusbar.sh
 python3 -m py_compile claude-zellij-pty.py
+python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' ssh-zellij
 
 # Unit-style hook tests (see README "Hook tests" for more cases)
 RESURRECT_COMMAND="claude" ./zellij-resurrect-hook.sh
@@ -29,6 +30,7 @@ RESURRECT_COMMAND="claude --session-id 11111111-1111-1111-1111-111111111111" ./z
 RESURRECT_COMMAND="python3 /x/claude-zellij-pty.py --wrapper /x/claude-zellij --marker abc -- claude --session-id def" ./zellij-resurrect-hook.sh
 RESURRECT_COMMAND="codex" ./zellij-resurrect-hook.sh
 RESURRECT_COMMAND="codex exec do something" ./zellij-resurrect-hook.sh
+RESURRECT_COMMAND="ssh user@server.example.com" ./zellij-resurrect-hook.sh
 
 # End-to-end crash test (destructive — kills all zellij sessions)
 zellij -s test-recovery
@@ -37,9 +39,9 @@ pkill -9 zellij
 zellij attach test-recovery
 ```
 
-## Architecture: the three moving parts
+## Architecture: the moving parts
 
-Session recovery hinges on how these three pieces cooperate. A change in one usually requires thinking about the other two.
+Session recovery hinges on how the wrappers, the resurrection hook and the PTY proxy cooperate. A change in one usually requires thinking about the other two.
 
 ### 1. The wrappers (`claude-zellij`, `codex-zellij`)
 
@@ -59,6 +61,7 @@ The wrappers also have **passthrough rules** — specific flags (`-p`, `--resume
 Zellij calls this via `post_command_discovery_hook` with `RESURRECT_COMMAND` in the environment. It must print the (possibly rewritten) command to stdout.
 
 Matching order matters:
+0. `ssh <args>` → `<hook dir>/ssh-zellij <args>` (rest of the line verbatim) when ssh-zellij is installed next to the hook. It comes first so a remote command mentioning claude/codex is never rewritten as a local one. Bare `ssh` with no arguments is left alone.
 1. `... claude-zellij-pty.py --wrapper <path> --marker <uuid> [args] -- claude ...` → `<wrapper> --zellij-marker <uuid> [args]`. This is the normal serialized form of a claude-zellij pane (the proxy is the pane leader) and **must be matched before rule 3**: the proxy command line contains `.../claude-zellij ` as the `--wrapper` value, so rule 3's glob would otherwise pass it through verbatim and replay the stale `claude --session-id` child command.
 2. `claude --session-id <uuid> ...` / `claude --resume <uuid> ...` → `claude --resume <uuid> ...` if `~/.claude/projects/*/<uuid>.jsonl` exists, else `claude --continue ...`. Bare `claude` → `claude --continue` (best-effort, per-CWD).
 3. `claude-zellij ...` / `codex-zellij ...` (including full-path variants) → passed through unchanged so the wrapper's own marker logic runs.
@@ -85,6 +88,19 @@ Two-part workaround:
 
 To reproduce/verify: start a session, open ~6 panes, `kill -9` its server (never `pkill zellij` — other sessions!), `zellij attach`, then `zellij action next-swap-layout` and inspect `zellij action dump-layout` — the status-bar pane must stay the last top-level node of the tab.
 
+### 5. The ssh reconnect proxy (`ssh-zellij`)
+
+A plain ssh pane freezes when the network path dies (sleep, Wi-Fi/VPN change, Tailscale dropping the local 100.x address): with `ServerAliveInterval` unset ssh waits for the kernel (~15 min of retransmission with unacknowledged keystrokes, 2 h of TCP keepalive when idle), and raw mode sends every key, Ctrl+C included, into the dead socket. Zellij has no action that restarts or signals a pane's process, so the fix lives in the pane.
+
+`ssh-zellij` is a single Python script (no bash wrapper, no marker): a PTY proxy that runs `ssh` on a private PTY whose termios and size are copied from the pane, so the remote PTY gets the same modes as with plain ssh.
+- Ctrl+Y (`SSH_ZELLIJ_KEY`) at any time: SIGTERM+SIGCONT to ssh's process group, SIGKILL after 0.5 s, reset terminal modes, start ssh again. The key is also recognized in kitty CSI-u and modifyOtherKeys encodings (other terminals; Zellij 0.45.1 sends the raw byte even in kitty mode).
+- ssh exit is classified from its status and the last 3 output lines: not 255 → exit with it (normal logout); 255 + auth/host-key/config message → wait for a key (auto-retry could trigger fail2ban); 255 + `Connection to X closed.` (`~.` or a logout returning 255) → wait for a key; other 255 → lost → automatic reconnect with backoff 1..30 s (reset after a session lasted 60 s), only when there is no remote command (`SSH_ZELLIJ_AUTO` overrides).
+- `ServerAliveInterval=10` / `ConnectTimeout=10` are injected only when `ssh -G` reports them unset and the arguments don't mention them. ssh drops the link on the 4th unanswered probe, so detection takes ~40 s.
+- Passthrough (`exec ssh`) when stdin/stdout is not a TTY, no destination is found, `ssh -G` rejects the arguments, or `-f/-G/-O/-Q/-V/-W` is given. `parse_ssh_args()` mirrors OpenSSH's getopt loop, which keeps parsing options after the destination; update `VALUE_OPTIONS` if ssh gains options.
+- Serialization: a shell pane running it is discovered as `python3 .../ssh-zellij <args>` and passes through the hook unchanged; a bare `ssh` pane is upgraded by hook rule 0.
+
+Verify against a real sshd without touching remote machines: run a user-level `/usr/sbin/sshd -f <cfg> -E <log>` on 127.0.0.1 with a scratch host key and `authorized_keys` (`UsePAM no`, `StrictModes no`), then simulate a dead link by SIGSTOPping the per-connection `sshd` processes under the listener. TCP stays up, so plain ssh hangs forever while ssh-zellij detects the loss through ServerAlive probes.
+
 ## Installer invariants
 
 `install.sh` patches recovery settings in `~/.config/zellij/config.kdl`: `on_force_close "detach"`, `session_serialization true`, `post_command_discovery_hook "<path>"`. All three are required for the recovery loop; removing any one silently breaks recovery. It also enables `mouse_mode true` and removes the obsolete managed scroll-shortcut block from earlier installations. Codex scrolling with normal rich output requires Zellij >= 0.44.1; tested with 0.45.1. `upgrade-zellij.sh` installs a pinned, checksum-verified release and `zellij-dispatch` routes actions inside old sessions to their ancestor server executable. Servers cannot be upgraded by detach/reattach; migrate into a new server while retaining old processes. Do not force `tui.raw_output_mode=true`: it expands tool output and sacrifices the compact display the user wants. Test actual multi-screen conversation history, not shell output printed before Codex starts. With `--with-layout` it additionally sets `default_layout "statusbar-fixed"`. It always installs and runs `zellij-fix-statusbar.sh` (safe: only touches dead sessions' caches), which uses `zellij-layout-repair.py` and backs up changed files. The dispatcher also runs it before loading saved sessions. Besides plugin aliases it repairs the stock bare `new_tab_template { pane cwd="/" }` and removes the dump's top-level common-root cwd after making saved paths absolute. Both defects must be fixed for restored tabs to retain their bar and inherit cwd. Live detection must include the cache/socket version because old/new servers can share a session name. Bash's outer-shell executable cache may require `hash -r` after installation; inspect the actual client executable, not just PATH.
@@ -92,7 +108,7 @@ To reproduce/verify: start a session, open ~6 panes, `kill -9` its server (never
 Hard rules enforced by the installer (preserve these if editing):
 - It **aborts** if an active `post_command_discovery_hook` pointing elsewhere already exists — never silently overwrite a user's hook.
 - The `statusbar-fixed` layout is installed under its own name and never replaces the built-in `default` layout (`default_layout` is a config pointer, not a file overwrite).
-- `codex-zellij` is only installed when `codex` is on PATH.
+- `codex-zellij` is only installed when `codex` is on PATH; `ssh-zellij` only when `ssh` is on PATH (hook rule 0 checks that it exists next to the hook).
 - `patch_setting()` uses awk to replace the first match (commented or active) and drop duplicates; don't rewrite this with `sed -i` — it needs to handle `//`-commented variants too.
 
 ## Gotchas
