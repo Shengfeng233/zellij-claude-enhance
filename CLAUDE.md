@@ -11,7 +11,10 @@ Per-pane session recovery for Claude Code and Codex CLI running inside Zellij, C
 ```bash
 # Install / reinstall to ~/.local/bin and patch ~/.config/zellij/config.kdl
 ./install.sh
-./install.sh --with-layout   # also installs statusbar-fixed.kdl
+./install.sh --with-layout   # also installs statusbar-fixed.kdl (+ Move Tab status bar on Zellij 0.45.x)
+
+# Rebuild the Move Tab status bar after bumping status-bar/ZELLIJ_VERSION (temp Rust toolchain, ~3 min):
+./status-bar/build.sh
 
 # Regression tests (color environment, layout repair, ssh-zellij PTY proxy + hook rule):
 python3 -m unittest discover -s tests -v
@@ -101,6 +104,16 @@ A plain ssh pane freezes when the network path dies (sleep, Wi-Fi/VPN change, Ta
 
 Verify against a real sshd without touching remote machines: run a user-level `/usr/sbin/sshd -f <cfg> -E <log>` on 127.0.0.1 with a scratch host key and `authorized_keys` (`UsePAM no`, `StrictModes no`), then simulate a dead link by SIGSTOPping the per-connection `sshd` processes under the listener. TCP stays up, so plain ssh hangs forever while ssh-zellij detects the loss through ServerAlive probes.
 
+### 6. The Move Tab status bar (`status-bar/`)
+
+Zellij binds `MoveTab` to `Alt i` / `Alt o`, but the built-in status bar's hint lists are hard-coded per action and never include it. `zellij:` plugins always load from the binary's embedded assets (a plugin-dir copy is ignored), so the hint needs a patched build loaded as a `file:` plugin. `status-bar/move-tab-hint.patch` (against the tag in `status-bar/ZELLIJ_VERSION`) adds `<i|o> Move Tab` to the normal-mode `Alt` group (appended last; prefers short labels plus the hint over long labels without it, never displaces an upstream entry) and `Move tab` to the tab- and move-mode lists, and calls `request_permission(ReadApplicationState, ChangeApplicationState)` because only `zellij:` plugins get permissions implicitly. `status-bar.wasm` is the committed build; `build.sh` reproduces it (byte differences come from embedded build paths).
+
+- `install.sh --with-layout` installs it to `~/.local/share/zellij-improve/plugins/status-bar.wasm` only when the Zellij new sessions use (`zellij-improve/current/zellij`, not the dispatcher) matches its release series, and rewrites `location="zellij:status-bar"` in the installed layout to the absolute `file:` URL. Otherwise (or `--stock-status-bar`) it removes the plugin and installs the repo layout unchanged. The repo's `statusbar-fixed.kdl` keeps `zellij:status-bar`.
+- Use an absolute path: `file:` locations are shell-expanded at parse time and serialized as `file:<abs>`, so live panes and swap slots match after resurrection like the `zellij:` form (verified: kill -9, resurrect, 3x next-swap-layout, bar stays last).
+- Zellij keys permission grants by the bare plugin path in `~/.cache/zellij/permissions.kdl` (`$XDG_CACHE_HOME`). Without a grant the bar shows a y/n prompt in its one-row, unselectable pane that cannot be answered. `zellij-fix-statusbar.sh` therefore re-grants it on every run (dispatcher, hook, installer) while the plugin file exists.
+- `zellij-layout-repair.py --status-bar <wasm>` normalizes dead sessions' saved bars: the patched URL is first turned back into `zellij:status-bar` so the stock-template regexes still match, then every `zellij:status-bar` becomes the installed `file:` URL. Without `--status-bar` (plugin removed) saved patched bars revert to `zellij:status-bar`. The fixer passes `--status-bar` only for `contract_version_*` cache dirs (0.45+); release-numbered dirs (`0.43.1/`) belong to legacy servers the plugin was not built for and stay stock.
+- When bumping `upgrade-zellij.sh`'s version, bump `status-bar/ZELLIJ_VERSION`, refresh the patch if it no longer applies, rebuild, and reinstall with `--with-layout`. A plugin built against another release may fail to load, which would leave an error in place of the bar.
+
 ## Installer invariants
 
 `install.sh` patches recovery settings in `~/.config/zellij/config.kdl`: `on_force_close "detach"`, `session_serialization true`, `post_command_discovery_hook "<path>"`. All three are required for the recovery loop; removing any one silently breaks recovery. It also enables `mouse_mode true` and removes the obsolete managed scroll-shortcut block from earlier installations. Codex scrolling with normal rich output requires Zellij >= 0.44.1; tested with 0.45.1. `upgrade-zellij.sh` installs a pinned, checksum-verified release and `zellij-dispatch` routes actions inside old sessions to their ancestor server executable. Servers cannot be upgraded by detach/reattach; migrate into a new server while retaining old processes. Do not force `tui.raw_output_mode=true`: it expands tool output and sacrifices the compact display the user wants. Test actual multi-screen conversation history, not shell output printed before Codex starts. With `--with-layout` it additionally sets `default_layout "statusbar-fixed"`. It always installs and runs `zellij-fix-statusbar.sh` (safe: only touches dead sessions' caches), which uses `zellij-layout-repair.py` and backs up changed files. The dispatcher also runs it before loading saved sessions. Besides plugin aliases it repairs the stock bare `new_tab_template { pane cwd="/" }` and removes the dump's top-level common-root cwd after making saved paths absolute. Both defects must be fixed for restored tabs to retain their bar and inherit cwd. Live detection must include the cache/socket version because old/new servers can share a session name. Bash's outer-shell executable cache may require `hash -r` after installation; inspect the actual client executable, not just PATH.
@@ -108,6 +121,7 @@ Verify against a real sshd without touching remote machines: run a user-level `/
 Hard rules enforced by the installer (preserve these if editing):
 - It **aborts** if an active `post_command_discovery_hook` pointing elsewhere already exists — never silently overwrite a user's hook.
 - The `statusbar-fixed` layout is installed under its own name and never replaces the built-in `default` layout (`default_layout` is a config pointer, not a file overwrite).
+- The Move Tab status bar is installed only with `--with-layout` and a matching Zellij release series; without `--with-layout` the plugin and the installed layout are left as they are, so the layout never points at a missing plugin.
 - `codex-zellij` is only installed when `codex` is on PATH; `ssh-zellij` only when `ssh` is on PATH (hook rule 0 checks that it exists next to the hook).
 - `patch_setting()` uses awk to replace the first match (commented or active) and drop duplicates; don't rewrite this with `sed -i` — it needs to handle `//`-commented variants too.
 

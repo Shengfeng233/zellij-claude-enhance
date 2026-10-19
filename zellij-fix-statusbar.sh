@@ -12,6 +12,11 @@
 # cached session-layout.kdl of every session that is not currently running.
 # Live sessions are skipped: their in-memory layout is already parsed and the
 # server would overwrite the file on its next serialization tick anyway.
+#
+# When the status bar with the Move Tab hint is installed (install.sh
+# --with-layout), saved status bars are switched to it, and back to the stock
+# bar once it is removed. It is a file: plugin, so its permissions are granted
+# here too: the dispatcher runs this script before any new server starts.
 
 set -euo pipefail
 
@@ -20,8 +25,17 @@ shopt -s nullglob
 fixed=0
 skipped_live=0
 repair_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/zellij-layout-repair.py"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/zellij"
+status_bar="$HOME/.local/share/zellij-improve/plugins/status-bar.wasm"
 
-for layout_file in "$HOME"/.cache/zellij/*/session_info/*/session-layout.kdl; do
+status_bar_args=()
+if [[ -f "$status_bar" ]]; then
+    status_bar_args=(--status-bar "$status_bar")
+    mkdir -p "$cache_dir"
+    python3 "$repair_script" "${status_bar_args[@]}" --grant "$cache_dir/permissions.kdl"
+fi
+
+for layout_file in "$cache_dir"/*/session_info/*/session-layout.kdl; do
     session_name="$(basename "$(dirname "$layout_file")")"
     cache_version="$(basename "$(dirname "$(dirname "$(dirname "$layout_file")")")")"
 
@@ -33,7 +47,13 @@ for layout_file in "$HOME"/.cache/zellij/*/session_info/*/session-layout.kdl; do
         continue
     fi
 
-    result="$(python3 "$repair_script" "$layout_file")"
+    # Pre-0.45 servers keep caches under their release number and may resume
+    # them; the patched bar is built for the current release, so keep theirs.
+    bar_args=("${status_bar_args[@]}")
+    if [[ "$cache_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        bar_args=()
+    fi
+    result="$(python3 "$repair_script" "${bar_args[@]}" "$layout_file")"
     if [[ -n "$result" ]]; then
         echo "$result"
         fixed=$((fixed + 1))

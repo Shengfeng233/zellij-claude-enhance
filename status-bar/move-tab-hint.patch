@@ -1,0 +1,120 @@
+diff --git a/default-plugins/status-bar/src/main.rs b/default-plugins/status-bar/src/main.rs
+index f12da1c..dbcc9db 100644
+--- a/default-plugins/status-bar/src/main.rs
++++ b/default-plugins/status-bar/src/main.rs
+@@ -238,6 +238,12 @@ impl ZellijPlugin for State {
+             .map(|c| c == "true")
+             .unwrap_or(false);
+         set_selectable(false);
++        // zellij-improve: loaded from a file: URL, so ask for what the built-in
++        // gets implicitly. The installer pre-grants this in permissions.kdl.
++        request_permission(&[
++            PermissionType::ReadApplicationState,
++            PermissionType::ChangeApplicationState,
++        ]);
+         subscribe(&[
+             EventType::ModeUpdate,
+             EventType::TabUpdate,
+diff --git a/default-plugins/status-bar/src/one_line_ui.rs b/default-plugins/status-bar/src/one_line_ui.rs
+index 63d3a78..4429c5a 100644
+--- a/default-plugins/status-bar/src/one_line_ui.rs
++++ b/default-plugins/status-bar/src/one_line_ui.rs
+@@ -968,6 +968,9 @@ fn secondary_keybinds(
+         .collect(),
+     );
+     let no_common_modifier = common_modifiers.is_empty();
++    // zellij-improve: advertise MoveTab (stock Alt i / Alt o) after the other
++    // shortcuts. It is dropped before any upstream shortcut is.
++    let move_tab_info = move_tab_shortcut(help, &move_tab_keys(binds), &common_modifiers);
+ 
+     if no_common_modifier {
+         let new_pane_start = secondary_info.len;
+@@ -1100,9 +1103,14 @@ fn secondary_keybinds(
+         floating_range = ribbon_range(floating_start, secondary_info.len);
+     }
+ 
+-    if secondary_info.len <= max_len {
++    // zellij-improve: prefer the short labels plus Move Tab over the long
++    // labels without it; otherwise behave exactly as upstream.
++    if secondary_info.len + move_tab_info.len <= max_len {
++        secondary_info.append(&move_tab_info);
+         return (secondary_info, new_pane_range, floating_range);
+     }
++    let long_line = (secondary_info.len <= max_len)
++        .then(|| (secondary_info, new_pane_range, floating_range));
+     let mut short_line = LinePart::default();
+     if no_common_modifier {
+         let new_pane_start = short_line.len;
+@@ -1234,7 +1242,12 @@ fn secondary_keybinds(
+         }
+         floating_range = ribbon_range(floating_start, short_line.len);
+     }
+-    if short_line.len <= max_len {
++    if short_line.len + move_tab_info.len <= max_len {
++        short_line.append(&move_tab_info);
++        (short_line, new_pane_range, floating_range)
++    } else if let Some(long_line) = long_line {
++        long_line
++    } else if short_line.len <= max_len {
+         (short_line, new_pane_range, floating_range)
+     } else if max_len >= 3 {
+         let overflow_text = Text::new(format!("{:>width$}", "...", width = max_len));
+@@ -1257,6 +1270,40 @@ fn secondary_keybinds(
+     }
+ }
+ 
++fn move_tab_keys(binds: &[(KeyWithModifier, Vec<Action>)]) -> Vec<KeyWithModifier> {
++    let mut keys = vec![];
++    for (direction, preferred) in [(Direction::Left, 'i'), (Direction::Right, 'o')] {
++        let candidates = action_key(binds, &[Action::MoveTab { direction }]);
++        if let Some(key) = candidates
++            .iter()
++            .find(|k| k.is_key_with_alt_modifier(BareKey::Char(preferred)))
++            .or_else(|| candidates.iter().next())
++        {
++            keys.push(key.clone());
++        }
++    }
++    keys
++}
++
++fn move_tab_shortcut(
++    help: &ModeInfo,
++    keys: &Vec<KeyWithModifier>,
++    common_modifiers: &Vec<KeyModifier>,
++) -> LinePart {
++    if common_modifiers.is_empty() {
++        return add_shortcut(help, "Move Tab", keys, false, Some(0));
++    }
++    // Inside the "Alt + ..." group only keys carrying that prefix make sense.
++    if !keys.iter().all(|k| k.has_modifiers(common_modifiers)) {
++        return LinePart::default();
++    }
++    let keys = keys
++        .iter()
++        .map(|k| k.strip_common_modifiers(common_modifiers))
++        .collect();
++    add_shortcut_with_inline_key(help, "Move Tab", keys, false)
++}
++
+ fn text_as_line_part_with_emphasis(text: String, emphases_index: usize, dimmed: bool) -> LinePart {
+     let part = if dimmed {
+         serialize_text(&Text::new(&text).disabled().opaque())
+@@ -1718,6 +1765,8 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
+             first_pane_unblock_condition: None,
+         }, TO_NORMAL])),
+         (s("Change focus"), s("Move"), focus_keys),
++        (s("Move tab"), s("Move tab"), action_key_group(&km, &[
++            &[A::MoveTab{direction: Dir::Left}], &[A::MoveTab{direction: Dir::Right}]])),
+         (s("Close"), s("Close"), single_action_key(&km, &[A::CloseTab, TO_NORMAL])),
+         (s("Rename"), s("Rename"),
+             single_action_key(&km, &[A::SwitchToMode{input_mode: IM::RenameTab}, A::TabNameInput{input: vec![0]}])),
+@@ -1752,6 +1801,8 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
+         (s("Switch Location"), s("Move"), action_key_group(&km, &[
+             &[Action::MovePane{direction: Some(Dir::Left)}], &[Action::MovePane{direction: Some(Dir::Down)}],
+             &[Action::MovePane{direction: Some(Dir::Up)}], &[Action::MovePane{direction: Some(Dir::Right)}]])),
++        (s("Move tab"), s("Move tab"), action_key_group(&km, &[
++            &[A::MoveTab{direction: Dir::Left}], &[A::MoveTab{direction: Dir::Right}]])),
+         (s("When done"), s("Back"), to_basemode_key),
+     ]} else if mi.mode == IM::Scroll { vec![
+         (s("Enter search term"), s("Search"),

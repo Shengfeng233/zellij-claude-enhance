@@ -5,6 +5,8 @@
 # Usage:
 #   ./install.sh              Install recovery only
 #   ./install.sh --with-layout  Install recovery + statusbar-fixed.kdl layout
+#                               (its status bar also lists Move Tab, Alt i / Alt o)
+#   ./install.sh --with-layout --stock-status-bar  Same layout, Zellij's own bar
 
 set -euo pipefail
 
@@ -14,23 +16,32 @@ CONFIG_DIR="$HOME/.config/zellij"
 LAYOUT_DIR="$CONFIG_DIR/layouts"
 CONFIG_FILE="$CONFIG_DIR/config.kdl"
 HOOK_PATH="$BIN_DIR/zellij-resurrect-hook.sh"
+STATUS_BAR_WASM="$HOME/.local/share/zellij-improve/plugins/status-bar.wasm"
 
 WITH_LAYOUT=false
+STOCK_STATUS_BAR=false
 for arg in "$@"; do
     case "$arg" in
         --with-layout) WITH_LAYOUT=true ;;
+        --stock-status-bar) STOCK_STATUS_BAR=true ;;
         -h|--help)
-            echo "Usage: $0 [--with-layout]"
-            echo "  --with-layout  Also install statusbar-fixed.kdl layout"
+            echo "Usage: $0 [--with-layout [--stock-status-bar]]"
+            echo "  --with-layout       Also install statusbar-fixed.kdl layout; its status bar"
+            echo "                      also lists Move Tab (Alt i / Alt o)"
+            echo "  --stock-status-bar  Use Zellij's own status bar in that layout"
             exit 0
             ;;
         *)
             echo "Unknown option: $arg" >&2
-            echo "Usage: $0 [--with-layout]" >&2
+            echo "Usage: $0 [--with-layout [--stock-status-bar]]" >&2
             exit 1
             ;;
     esac
 done
+if $STOCK_STATUS_BAR && ! $WITH_LAYOUT; then
+    echo "--stock-status-bar only applies together with --with-layout" >&2
+    exit 1
+fi
 
 # --- Helper: patch a single setting in config.kdl ---
 # Replaces the first matching line (commented or active) and drops later duplicates.
@@ -128,8 +139,35 @@ echo "Installing zellij-fix-statusbar.sh -> $BIN_DIR/zellij-fix-statusbar.sh"
 cp "$SCRIPT_DIR/zellij-fix-statusbar.sh" "$BIN_DIR/zellij-fix-statusbar.sh"
 chmod +x "$BIN_DIR/zellij-fix-statusbar.sh"
 
+# --- Status bar with the Move Tab hint (statusbar-fixed layout only) ---
+# Zellij's built-in bar never lists MoveTab (Alt i / Alt o) and cannot be
+# replaced, so the layout loads a patched build (status-bar/) as a file:
+# plugin. The build is tied to the Zellij release series it was compiled
+# against; any other version keeps the stock bar. Check the binary new
+# sessions use, not the dispatcher, which follows the current session.
+if $WITH_LAYOUT; then
+    status_bar_version="$(<"$SCRIPT_DIR/status-bar/ZELLIJ_VERSION")"
+    new_session_zellij="$HOME/.local/share/zellij-improve/current/zellij"
+    [[ -x "$new_session_zellij" ]] || new_session_zellij="$(command -v zellij)"
+    zellij_version="$("$new_session_zellij" --version)"
+    zellij_version="${zellij_version#zellij }"
+    if ! $STOCK_STATUS_BAR && [[ "${zellij_version%.*}" == "${status_bar_version%.*}" ]]; then
+        echo "Installing status bar with Move Tab hint -> $STATUS_BAR_WASM"
+        mkdir -p "$(dirname "$STATUS_BAR_WASM")"
+        install -m 644 "$SCRIPT_DIR/status-bar/status-bar.wasm" "$STATUS_BAR_WASM.new"
+        mv "$STATUS_BAR_WASM.new" "$STATUS_BAR_WASM"
+    else
+        if ! $STOCK_STATUS_BAR; then
+            echo "Using the stock status bar: the Move Tab hint build targets Zellij" \
+                "$status_bar_version, new sessions use $zellij_version."
+        fi
+        rm -f "$STATUS_BAR_WASM"
+    fi
+fi
+
 # Heal serialized layouts of dead sessions (status-bar resurrection bug).
-# Only touches sessions that are not running; safe to repeat.
+# Only touches sessions that are not running; safe to repeat. It also grants
+# the patched status bar its permissions and switches saved sessions to it.
 echo "Normalizing serialized session layouts (status-bar fix)..."
 "$BIN_DIR/zellij-fix-statusbar.sh" | sed 's/^/  /'
 
@@ -211,7 +249,13 @@ done
 # --- Optional layout ---
 if $WITH_LAYOUT; then
     echo "Installing statusbar-fixed.kdl -> $LAYOUT_DIR/statusbar-fixed.kdl"
-    cp "$SCRIPT_DIR/statusbar-fixed.kdl" "$LAYOUT_DIR/statusbar-fixed.kdl"
+    if [[ -f "$STATUS_BAR_WASM" ]]; then
+        # An absolute file: URL serializes unchanged, like the zellij: form.
+        sed "s#location=\"zellij:status-bar\"#location=\"file:$STATUS_BAR_WASM\"#" \
+            "$SCRIPT_DIR/statusbar-fixed.kdl" > "$LAYOUT_DIR/statusbar-fixed.kdl"
+    else
+        cp "$SCRIPT_DIR/statusbar-fixed.kdl" "$LAYOUT_DIR/statusbar-fixed.kdl"
+    fi
     patch_setting "default_layout" '"statusbar-fixed"' "$CONFIG_FILE"
     echo "Patched: default_layout \"statusbar-fixed\" (keeps the status bar pinned)"
 fi
@@ -260,6 +304,14 @@ for setting in on_force_close session_serialization post_command_discovery_hook 
         echo "  WARNING: $setting not found in config" >&2
     fi
 done
+
+if $WITH_LAYOUT; then
+    if [[ -f "$STATUS_BAR_WASM" ]]; then
+        echo "  status bar: Move Tab hint ($STATUS_BAR_WASM)"
+    else
+        echo "  status bar: stock (zellij:status-bar)"
+    fi
+fi
 
 # Run zellij setup --check
 echo ""

@@ -160,7 +160,10 @@ zellij attach <session-name>
 
 ```bash
 ./install.sh --with-layout
+./install.sh --with-layout --stock-status-bar   # same layout, Zellij's own status bar
 ```
+
+The layout's status bar also lists **Move Tab** (`Alt+i` / `Alt+o`), which Zellij's own bar never shows. See [Move Tab hint](#move-tab-hint).
 
 ### What the installer does
 
@@ -181,7 +184,7 @@ zellij attach <session-name>
 | `pane_frame_style` | `"full"` | Keep full pane boundaries, spacing, and scroll-position display |
 
 5. Removes the obsolete managed scroll-shortcut block from earlier installations. The scrolling fix is in the upgraded Zellij terminal parser.
-6. With `--with-layout`: installs `statusbar-fixed.kdl` and sets `default_layout "statusbar-fixed"` so every new session keeps the status bar pinned
+6. With `--with-layout`: installs `statusbar-fixed.kdl` and sets `default_layout "statusbar-fixed"` so every new session keeps the status bar pinned. When new sessions run Zellij 0.45.x it also installs the status bar with the Move Tab hint to `~/.local/share/zellij-improve/plugins/status-bar.wasm`, points the layout at it and grants it its permissions; `--stock-status-bar` or any other Zellij version keeps the built-in bar
 7. Installs `zellij-color-env.sh` and sources it from the wrappers and existing Bash/Zsh rc files (backed up first). It repairs automation-inherited color settings only in interactive Zellij panes.
 
 The installer **will not** silently overwrite an existing `post_command_discovery_hook`. If a conflict is detected, it aborts with a clear error.
@@ -329,6 +332,27 @@ zellij-fix-statusbar.sh
 
 Sessions that are currently running cannot be healed in place (the server rewrites their cache); they get healed automatically after they exit or crash.
 
+### Move Tab hint
+
+Zellij binds `Alt+i` / `Alt+o` to move the current tab left / right, but its status bar never mentions it: the hint list is compiled into the built-in plugin. `status-bar/` holds a patched build of that plugin (Zellij 0.45.1 plus `move-tab-hint.patch`) that adds:
+
+| Mode | Hint |
+|---|---|
+| Normal | `Alt + … <i\|o> Move Tab` after the other `Alt` shortcuts |
+| Tab (`Ctrl+t`) | `Alt <i\|o> Move tab` after Move (focus) |
+| Move (`Ctrl+h`) | `Alt <i\|o> Move tab` after Switch Location |
+
+The keys come from your keybindings, so a rebound `MoveTab` is shown as bound. In normal mode the hint is the first to go when the line is short: the bar uses short labels (`New`, `Focus`) to keep it, and below about 165 columns with several panes Zellij already replaces the whole `Alt` group with `...`. Tab mode shows it at any width.
+
+Built-in plugins load from inside the Zellij binary, so the layout loads this one as `file:/home/<you>/.local/share/zellij-improve/plugins/status-bar.wasm`. The absolute URL serializes unchanged, so the bar stays pinned across resurrection as with `zellij:`. A `file:` plugin needs permission to read the session state; a prompt in a one-row, unfocused pane could not be answered, so `zellij-fix-statusbar.sh` pre-grants it in `~/.cache/zellij/permissions.kdl` (it runs before every new server via `~/.local/bin/zellij`) and switches dead sessions' saved bars to the installed one, or back to `zellij:status-bar` when it is removed.
+
+Running sessions keep the bar they started with; new sessions, and sessions resurrected later, get the hint. The plugin is tied to the Zellij release series it was built for; after changing `upgrade-zellij.sh`'s version, set `status-bar/ZELLIJ_VERSION` and rebuild:
+
+```bash
+./status-bar/build.sh    # clones that Zellij release, applies the patch, builds with its pinned Rust in a temp dir
+./install.sh --with-layout
+```
+
 ## Verification
 
 ### Syntax check
@@ -413,6 +437,8 @@ zellij attach test-recovery
 | `zellij-fix-statusbar.sh` | `~/.local/bin/zellij-fix-statusbar.sh` | Heals serialized session layouts so status bars survive resurrection |
 | `zellij-layout-repair.py` | `~/.local/bin/zellij-layout-repair.py` | Repairs stock new-tab templates and serialized common-root cwd, with backups |
 | `statusbar-fixed.kdl` | `~/.config/zellij/layouts/statusbar-fixed.kdl` | Layout with pinned status bar (resurrection-safe plugin URLs) |
+| `status-bar/status-bar.wasm` | `~/.local/share/zellij-improve/plugins/status-bar.wasm` | Zellij 0.45.1 status bar plus the Move Tab hint (`--with-layout`) |
+| `status-bar/move-tab-hint.patch`, `build.sh`, `ZELLIJ_VERSION` | *(run from repo)* | Source patch and reproducible build of that plugin |
 | `upgrade-zellij.sh` | *(run from repo)* | Verified Zellij release installer; retains old servers |
 | `zellij-dispatch` | `~/.local/bin/zellij` | Routes CLI commands to the active server version |
 | `zellij-color-env.sh` | `~/.local/bin/zellij-color-env.sh` | Repairs automation-inherited color suppression in interactive panes |
@@ -424,6 +450,7 @@ zellij attach test-recovery
 rm ~/.local/bin/claude-zellij ~/.local/bin/claude-zellij-pty.py ~/.local/bin/codex-zellij ~/.local/bin/ssh-zellij ~/.local/bin/zellij-resurrect-hook.sh ~/.local/bin/zellij-fix-statusbar.sh
 rm -rf ~/.local/share/claude-zellij ~/.local/share/codex-zellij
 rm ~/.config/zellij/layouts/statusbar-fixed.kdl  # if installed
+rm -f ~/.local/share/zellij-improve/plugins/status-bar.wasm
 
 # Restore config from backup
 ls ~/.config/zellij/config.kdl.backup.*  # find your backup
@@ -453,6 +480,10 @@ The stored session no longer exists on disk: Claude Code deletes session files a
 ### Status bar moves after resurrecting a session
 
 Run `zellij-fix-statusbar.sh` (heals dead sessions' serialized layouts), and install the pinned layout with `./install.sh --with-layout`. See [Status-Bar Pinning](#status-bar-pinning). Sessions that are already running stay vulnerable until their next restart; the layout cannot be changed in-place.
+
+### The status bar shows `This plugin asks permission to: ...`
+
+The Move Tab status bar lost its grant (for example after `~/.cache/zellij` was cleared). Run `zellij-fix-statusbar.sh` and open a new session; the dispatcher also re-grants it before starting any new server. To go back to Zellij's own bar, run `./install.sh --with-layout --stock-status-bar`.
 
 ### Ctrl+Y does not reboot Claude
 
