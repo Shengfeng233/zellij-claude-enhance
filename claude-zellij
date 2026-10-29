@@ -88,29 +88,39 @@ _watch_session_registry() {
     local registry="$HOME/.claude/sessions"
     trap '' INT TERM HUP  # Don't die from signals meant for claude
     set +e
-    local child sid f cand
+    local child sid f cand found=""
     while kill -0 "$wrapper_pid" 2>/dev/null; do
         sleep 1
-        # claude runs as the direct child of the proxy; re-resolve every tick
-        # because a Ctrl+Y reboot replaces the child. Skip our own subshell,
-        # which is also a child of the same pid.
-        f=""
-        for child in $(pgrep -P "$wrapper_pid" 2>/dev/null); do
-            [[ "$child" == "$BASHPID" ]] && continue
-            [[ -f "$registry/${child}.json" ]] && { f="$registry/${child}.json"; break; }
-        done
-        if [[ -z "$f" ]]; then
-            # Shim layouts where claude is a deeper descendant of the proxy
-            for cand in "$registry"/*.json; do
-                [[ -e "$cand" ]] || continue
-                child="${cand##*/}"
-                child="${child%.json}"
-                [[ "$child" =~ ^[0-9]+$ ]] || continue
+        # Keep the claude process found on an earlier tick while it lives:
+        # the scan below walks every file in the registry (hundreds, most of
+        # dead processes) and the parent chain of each live one, and doing
+        # that every second in every pane kept a core busy.
+        if [[ -n "$found" ]] && kill -0 "$found" 2>/dev/null && [[ -f "$registry/${found}.json" ]]; then
+            f="$registry/${found}.json"
+        else
+            # claude runs as the direct child of the proxy; resolved again once
+            # the kept one is gone, because a Ctrl+Y reboot replaces the child.
+            # Skip our own subshell, which is also a child of the same pid.
+            f=""
+            for child in $(pgrep -P "$wrapper_pid" 2>/dev/null); do
                 [[ "$child" == "$BASHPID" ]] && continue
-                kill -0 "$child" 2>/dev/null || continue
-                _is_descendant "$child" "$wrapper_pid" && { f="$cand"; break; }
+                [[ -f "$registry/${child}.json" ]] && { f="$registry/${child}.json"; break; }
             done
-            [[ -z "$f" ]] && continue
+            if [[ -z "$f" ]]; then
+                # Shim layouts where claude is a deeper descendant of the proxy
+                for cand in "$registry"/*.json; do
+                    [[ -e "$cand" ]] || continue
+                    child="${cand##*/}"
+                    child="${child%.json}"
+                    [[ "$child" =~ ^[0-9]+$ ]] || continue
+                    [[ "$child" == "$BASHPID" ]] && continue
+                    kill -0 "$child" 2>/dev/null || continue
+                    _is_descendant "$child" "$wrapper_pid" && { f="$cand"; break; }
+                done
+                [[ -z "$f" ]] && continue
+            fi
+            found="${f##*/}"
+            found="${found%.json}"
         fi
         sid="$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)"
         [[ -z "$sid" || "$sid" == "$current" ]] && continue
